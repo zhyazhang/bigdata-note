@@ -1,0 +1,9 @@
+server:
+  port: 8080
+
+
+myrabbitmq:
+  host: 192.168.49.211
+  port: 5672
+  name: zzy
+  possword: 123
