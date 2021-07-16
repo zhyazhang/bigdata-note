@@ -161,10 +161,10 @@ public class Consumer {
 
 启动消费端，此时查看管控台，新增了两个Exchange，两个Queue。在`test_dlx_queue`上我们设置了DLX，也就代表死信消息会发送到指定的Exchange上，最终其实会路由到`dlx.queue`上。
 
-![14795543-76d69a56ef1ad6a7](assets/14795543-76d69a56ef1ad6a7.png)
+![14795543-76d69a56ef1ad6a7](images/14795543-76d69a56ef1ad6a7.png)
 
 此时关闭消费端，然后启动生产端，查看管控台队列的消息情况，`test_dlx_queue`的值为1，而`dlx_queue`的值为0。10s后的队列结果如图，由于生产端发送消息时指定了消息的过期时间为10s，而此时没有消费端进行消费，消息便被路由到死信队列中。
 
-![14795543-2c020cefbd1820ce](assets/14795543-2c020cefbd1820ce.png)
+![14795543-2c020cefbd1820ce](images/14795543-2c020cefbd1820ce.png)
 
 实际环境我们还需要对死信队列进行一个监听和处理，当然具体的处理逻辑和业务相关，这里只是简单演示死信队列是否生效。
