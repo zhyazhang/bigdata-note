@@ -4,7 +4,7 @@
 
 [Java内存模型](doc/JVM/JMM.md)
 
-[逃逸分析](doc/JVM/逃逸分析)
+[逃逸分析](doc/JVM/逃逸分析.md)
 
 ### String
 
