@@ -31,3 +31,11 @@
 [JUC_AQS](doc/Thread/JUC_AQS.md)
 
 [Threa join方法](doc/Thread/Thread.join.md)
+
+### MQ
+
+[消息队列](doc/Mq/mq.md)
+
+[rabbitmq](doc/Mq/rabbitmq.md)
+
+[Java客户端接口（API）指南](doc/Mq/rabbitmq_Zh_CN.md)
