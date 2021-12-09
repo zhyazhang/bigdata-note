@@ -44,33 +44,33 @@ map的输出是中间结果：该中间结果由reduce任务处理后才产生�
 
 **HDFS写数据原理**
 
-![img](images/20140710141109143)
+![img](images/20140710141109143.png)
 
-![img](images/20140710141631268)
+![img](images/20140710141631268.png)
 
-![img](images/20140710141306611)
+![img](images/20140710141306611.png)
 
 **读数据原理**
 
-![img](images/20140711135958718)
+![img](images/20140711135958718.png)
 
 **HDFS故障类型和其检测方法**
 
-![img](images/20140711140419053)
+![img](images/20140711140419053.png)
 
-![img](images/20140711140159968)
+![img](images/20140711140159968.png)
 
 **读写故障的处理**
 
-![img](images/20140715175050651)
+![img](images/20140715175050651.png)
 
 **DataNode故障处理**
 
-![img](images/20140715175102616)
+![img](images/20140715175102616.png)
 
 **副本布局策略**
 
-![img](images/20140715175115049)
+![img](images/20140715175115049.png)
 
 ### 3.2 HDFS的概念
 
@@ -117,7 +117,7 @@ HDFS集群有两类节点以管理节点-工作节点模式运行，即一个nam
 
 客户端通过调用FileSystem对象的open()方法来打开希望读取的文件，对于HDFS来说，这个对象是DistributedFileSystem的一个实例。DistributedFileSystem通过使用远程过程调用(RPC)来调用namenode，以确定文件起始块的位置。对于每一个块，namenode返回存有该块副本的datanode地址。此外，这些打他弄得根据它们与客户端的距离来排序，如果该客户端本身就是一个datanode，那么该客户端将会从保存有相应数据块副本的本地datanode读取数据。
 
-<img src="images/hadoop_read_file_stream-1638967639702.png" alt="hadoop_read_file_stream" style="zoom:80%;" />
+<img src="images/hadoop_read_file_stream.png" alt="hadoop_read_file_stream" style="zoom:80%;" />
 
 >在读取数据的时候，如果DFSInputStream在与datanode通信时遇到错误，会尝试从这个块的另外一个最邻近datanode读取数据。他也会记住那个datanode，以保证以后不会反复读取该节点上后续的块。
 >
@@ -143,6 +143,245 @@ Hadoop把网络看作一棵树，两个节点间的距离是它们到**最近共
 >distance(/d1/r1/n1,/d1/r2/n3)=4	同一数据中心不同机架上的接待你
 >
 >distance(/d1/r1/n1,/d2/r3/n4)=6	不同数据中心中的节点
+
+#### 3.6.2剖析文件写入
+
+客户端通过对DistributedFileSystem对象调用create()来新建文件，DistributedFileSystem对namenode创建一个RPC调用，在文件系统的命名空间中新建一个文件，此时该文件中还没有相应的数据块。namenode执行各种不同的检查以确保这个文件不存在以及客户端有新建该文件的权限。如果这些检查均通过，那么namenode就会位创建新文件记录一条记录；否则，文件创建失败并向客户端抛出一个IOException异常。DistributedFileSystem向客户端返回一个FSDataOutPutStream对象，由此客户端可以开始写入数据。就向读取事件一样，FSDataOutStream封装一个DFSoutPutstream对象，该对象负责处理datanode和namenode之间的通信。
+
+
+
+![hdfs_write](images/hdfs_write.png)
+
+在客户端写入数据时，DFSOutputStream将它分成一个个的数据包，并写入内部队列，称为“数据队列”。DataStreamer处理数据队列，它的责任是挑选出适合存储数据副本的一组datanode，并据此来要求namenode分配新的数据块。这一组datanode构成一个管线（假设副本数为3），所有管线有3个节点。DataStreamer将数据包流式传输到管线中第一个datanode，该datanode存储数据包并将它发送到管线中的第2个datanode。同样，第2个datanode存储该数据包并且发送给管线中的第3个datanode。
+
+如果任何datanode在数据写入期间发生故障，则执行以下操作。首先关闭管线，确认把队列中的所有数据包都添加回数据队列的最前端，以确保故障节点下游的datanode不会漏掉任何一个数据包。为存储在另一正常datanode的当前数据块指定一个新的标识，并将该标识传送给namenode，以便故障datanode在恢复后可以删除存储的部分数据块。从管线中删除故障datanode，基于两个正常datanode构建一条新管线。余下的数据块写入管线中正常的datanode。namenode注意到块复本量不足时，会在另一个节点上创建一个新的复本，后续的数据块继续正常接受处理。
+
+- **复本怎么放？**
+
+Hadoop的默认布局策略是在运行客户端的节点上放第一个复本（如果客户端运行在集群之外，就随机选择一个节点，不过系统会避免挑选那么存储太满或太忙的节点）。第二个复本放在与第一个不同且随机另外选择的机架中节点上。第三个复本与第二个复本放在同一机架上，且随机选择另一个节点。其它复本放在集群中随机选择的节点上，不过系统会尽量避免在同一机架上放太多复本。
+
+#### 3.6.3 一致模型
+
+**文件系统的一致模型描述了文件读/写的数据可见性。**
+
+新建一个文件后，它能在文件系统的命名空间中立即可见，但是，写入文件的内容并不保证能立即可见，即使数据流已经刷新并存储。所以文件长度显示为0。**当写入的数据超过一个块后，第一个数据块对新的reader就是可见的，总之，当前正在写入的块对其它reader不可见。**
+
+```java
+Path p = new Path("p");
+OutputStream out = fs.create(p);
+out.write("content".getBytes("UTF-8"));
+out.flush();
+assertThat(fs.getFileStatus(p).getLen(),is(0L));
+```
+
+HDFS提供了一种强行将所有缓刷新到datanode中的手段，即对FSDataOutputStream调用**hflush()**方法。当hflush()方法返回成功后，对所有新的reader而言，HDFS能保证文件中到目前为止写入的数据均到达所有datanode的写入管道并且对所有新的reader均可见。
+
+```java
+Path p = new Path("p");
+FSDataOutStream out = fs.create(p);
+out.write("content".getBytes("UTF-8"));
+out.hflush();
+assertThat(fs.getFileStatus(p).getLen(),is(((long)"content".length())));
+```
+
+>hflush()不保证datanode已经将数据写到磁盘上，仅确保数据在datanode的内存中。为确保数据写到磁盘上，可以用**hsync()**替代。
+
+
+
+## 4 关于YARN
+
+**Apache YARN(Yet Another Resource Negotiator)是Hadoop的集群资源管理系统。**
+
+YARN提供请求和使用集群资源的API，但这些API很少直接用于用户代码。
+
+![yarn_application](images/yarn_application.png)
+
+
+
+### 4.1 剖析YARN应用运行机制
+
+YARN通过两类长期运行的守护进程提成自己的核心服务：**管理集群上资源使用的资源管理器(resource manager)**、**运行在集群中所有节点上且能够启动和监控容器(container)的节点管理器(node manager)**。容器用于执行特定应用程序的进程，每个容器都有资源限制。一个容器可以是一个Unix进程，也可以是一个linux cgroup，取决于YARN的配置。
+
+<img src="images/yarn_run.png" alt="yarn_run" style="zoom:80%;" />
+
+为了能在YARN上运行一个应用，首先，客户端联系资源管理器，要求它运行一个application master进程，然后，资源管理器找到一个能够在容器中启动application master的节点管理器。
+
+>YARN本身不会为应用的各部分彼此间通信提供任何手段，大多数重要的YARN应用使用某种形式的远程通信机制来向客户端传递状态更新和返回结果。
+
+#### 4.1.1 资源申请
+
+**YARN应用可以在运行中的任意时刻提出资源申请**。例如可以在最开始提出所有的请求，或者为了满足不断变化的应用需要，采取更为动态的方式在需要更多资源时提出请求。
+
+①Spark采用上述第一种方式，在集群上启动固定数量的执行器
+
+②MapReduce分两步，在最开始时申请map任务容器，reduce任务容器的启用则放在后期。同样，如果任何任务出现失败，将会另外申请容器以重新运行失败的任务。
+
+### 4.2 YARN与MapReduce 1相比
+
+**MapReduce 1中**，有辆类守护进程控制着作业执行过程：一个`jobtracker`以及一个或多个`tasktracker`。`jobtracker`通过调度`tasktracker`上运行的任务来协调所有运行在系统上的作业。`tasktracker`在运行任务的同时将运行进度报告发送给`jobtracker`，`jobtracker`由此记录每项作业任务的整体进度情况。如果其中一个任务失败，`jobtracker`可以在另一个`tasktracker`节点上重新调度该任务。
+
+**MapReduce 1中**，`jobtracker`同时负责**作业调度**和**任务进度监控**。相比之下，YARN中，这些职责是由不同的实体担负的：它们分别是资源管理器和application master(每个MapReduce作业一个)。`jobtracker`也负责存储已完成作业的作业历史，但是也可以运行一个作业历史服务器作为一个独立的守护进程来取代`jobtracker`。在YARN中，与之等价的角色是时间轴服务器(timeline server)，它主要用于存储应用历史。
+
+| MapReduce 1 | YARN                                         |
+| ----------- | -------------------------------------------- |
+| Jobtracker  | 资源管理器、application master、时间轴服务器 |
+| Tasktracker | 节点管理器                                   |
+| Slot        | 容器                                         |
+
+- **YARN的优点？**
+
+①可扩展性(Scalability)
+
+与MapReduce 1相比，YARN可以在更大规模的集群上运行。当节点数达到4000，任务数达到40000时，MapReduce 1会遇到可扩展性瓶颈，**瓶颈源自于jobtracker必须同时管理作业和任务**。YARN利用**资源管理器和application master分离的架构有带你克服了局限性**，可以扩展到接近`10000`个节点和`100000`个任务。
+
+②可用性(Availability)
+
+**当服务守护进程失败时，通过为另一个守护进程复制接管工作所需的状态以便其继续提供服务，从而可以获得高可用(HA,High availability)**。然而，`jobtracker`内存中大量快速变化的复杂状态使得改进`jobtracker`服务获得高可用性非常困难。
+
+③利用率(Utilization)
+
+MapReduce 1中，每个`tasktracker`都配置有若干固定长度的slot，这些slot时静态分配的，在配置的时候被划分为`map slot`和`reduce slot`。一个`map slot`仅能用于运行一个map任务，一个`reduce slot`仅能由于运行一个reduce任务。
+
+YARN中，一个节点管理器管理一个资源池，而不是指定的固定数目的slot。YARN上运行的MapReduce不会出现由于集群中仅有`map slot`可用导致reduce任务必须等待的情况。并且，YARN中的资源时精细化管理的，这样一个应用能够按需请求资源，而不是请求一个不可分割的、对于特定的任务而言可能会太大或太小的slot。
+
+④多租户
+
+YARN的最大优点在于向MapReduce以外的其它类型的分布式应用开放了Hadoop。MapReduce仅仅时许多YARN应用中的一个。
+
+用户甚至可以在同一个YARN集群上运行不同版本的MapReduce，这使得升级MapReduce的过程更好管理。
+
+### 4.3 YARN中的调度
+
+#### 4.3.1 调度选项
+
+| 策略       | 描述                                                         | 优点                       | 缺点             |
+| ---------- | ------------------------------------------------------------ | -------------------------- | ---------------- |
+| FIFO调度器 | 将应用放置在一个队列中，然后按照提交的顺序运行应用。首先为队列中第一个应用的请求分配资源，<br />第一个应用的请求被满足后再依次为队列中下一个应用服务。 | 简单易懂，不需要任何配置。 | 不适合共享集群。 |
+| 容量调度器 | 一个独立的专门队列保证小作业一提交就可以启动                 |                            | 大作业执行时间长 |
+| 公平调度器 | 不需要预留一定量的资源，调度器会在所有运行的作业之间动态平衡资源。第一个(大)作业启动时，<br />它也是唯一运行的作业，因而获得集群中所有的资源。当第二个(小)作业启动时，它被分配到集群的<br />一半资源，这样每个作业都能公平共享资源。 | 所有应用公平分配资源       |                  |
+
+#### 4.3.5 主导资源公平性
+
+- **如果一个用户的应用对CPU的需求很大，但对内存的需求量很少，而另一个用户需要很少的CPU，但对内存需求量很大，那么如何比较这两个应用？**
+
+YARN中调度器解决这个问题的思路是，观察每个用户的主导资源，并将其作为对集群资源使用的度量，次方法称为**主导资源公平性**(Dominant Resource Fairness,DRF)
+
+## 5 Hadoop的I/O操作
+
+- **检测数据是否损坏的常见措施？**
+
+在数据第一次引入系统时计算校验和并在数据通过一个不可靠的通道进行传输时再次进行计算校验和。如果计算所得的新校验和与原来的校验和不匹配，就可以认为数据已损坏。HDFS用于校验和计算的错误检测码是CRC-32C。
+
+>校验和也是可能损坏的，但由于校验和比数据小得多，所以损坏的可能性非常小。
+
+### 5.1 数据完整性
+
+#### 5.1.1 HDFS的数据完整性
+
+`datanode`负责在收到数据后存储该数据及其校验和之前对数据进行验证。它在收到客户端的数据或复制其它`datanode`的数据时执行这个操作。正在写数据的客户端将数据以及校验和发送到由一系列`datanode`组成的管线，管线中最后一个`datanode`负责验证校验和。如果`datanode`检测到错误，客户端便会收到一个`IOException`异常的一个子类。
+
+客户端从`datanode`读取数据时，也会验证校验和，将它们与`datanode`中存储的校验和进行比较。每个`datanode`均持久保存一个用于验证的校验和日志，所以它知道每个数据块的最后一次验证时间。客户端成功验证一个数据块后，会告诉这个`datanode`，`datanode`由此更新日志。
+
+不只是客户端在读取数据块时会验证校验和，每个`datanode`也会在一个后台线程中运行一个`DataBlockScanner`，从而定期验证存储在这个`datanode`上的所有数据块。
+
+- **数据修复**
+
+由于HDFS存储着每个数据块的复本，因此它可以通过数据复本来修复损坏的数据块，进而得到一个新的，完好无损的复本。
+
+基本思路是：
+
+①客户端在读取数据块时，如果检测到错误，首先向`namenode`报告已损坏的数据块及其正在尝试读操作的这个`datanode`，再抛出`ChecksumException`异常。
+
+②`namenode`将这个数据块复本标记为已损坏，这样它就不再将客户端处理请求直接发送到这个节点。
+
+③之后，它安排这个数据块的一个复本复制到另一个`datanode`，如此一来，数据块的复制因子又回到期望水平。此后，已损坏的数据块复本被删除。
+
+> 在使用`open()`方法读取文件之前，将`false`传递给`FileSystem`对象的`setVerifyChecksum()`方法，可以禁用校验和验证。
+>
+> 如果在命令解释器中使用带`-get`选项的`-ignoreCrc`命令或者使用等价的`-copyToLocal`命令，也可以达到相同的效果。
+
+- **禁用校验和计算**
+
+使用`RawLocalFileSystem`替代`LocalFileSystem`。
+
+### 5.2 压缩
+
+压缩格式：
+
+| 压缩格式 | 工具  | 算法    | 文件扩展名 | 是否可切分 |
+| -------- | ----- | ------- | ---------- | ---------- |
+| DEFLATE  | 无    | DEFLATE | .deflate   | 否         |
+| gzip     | gzip  | DEFLATE | .gz        | 否         |
+| bzip2    | bzip2 | bzip2   | .bz2       | 是         |
+| LZO      | lzop  | LZO     | .lzo       | 否         |
+| LZ4      | 无    | LZ4     | .lz4       | 否         |
+| Snappy   | 无    | Snappy  | .snappy    | 否         |
+
+> `DEFLATE`为标准压缩算法，标准实现是`zlib`。
+
+#### 5.2.2 压缩和输入分片
+
+> 在考虑如何压缩将由`MapReduce`处理的数据时，压缩格式是否支持切分非常重要。
+
+一个存储在HDFS文件系统中压缩前为`1GB`的文件，如果HDFS的块大小为`128MB`，那么文件将被存储在8个块中，把这个文件作为输入数据的MapReduce作业，将创建8个输入分片，其中每个分片作为一个单独的map任务的输入被独立处理。
+
+若文件经过`gzip`压缩的，压缩后文件大小为`1GB`。与以前一样，HDFS将这个文件保存为8个数据块。但是，无法将每个数据块单独作为一个输入分片，因为无法**实现从`gzip`压缩数据流的任意位置读取数据**，读取时无法从数据流的任意当前位置前进到下一块的骑士位置读取下一个数据块，从而实现与整个数据流的同步。在这种情况下，MapReduce会采用正确的做法，它不会尝试切分`gzip`压缩文件，但牺牲了数据的本地性：一个map任务处理8个HDFS块，而其中大多数块并没有存储在执行该map任务的节点上。并且，map任务数越少，作业的粒度就越大，因而运行的时间可能会更长。
+
+- **应该使用哪种压缩格式？**
+
+建议，大致按照效率从高到底排列：
+
+①使用容器文件格式，例如顺序文件、Avro数据文件、ORCFiles或者Parquet文件，这些文件格式同时支持压缩和切分。通常与一个快速压缩工具联合使用，如，`LZO`，`LZ4`或者`Snappy`。
+
+②使用支持切分的压缩格式，如`bzip2`，或者使用通过索引实现切分的压缩格式如`LZO`。
+
+③在应用中将文件切分成块，并使用任意一种压缩格式为每个数据块建立压缩文件。
+
+④ 存储未经压缩的文件。
+
+> 对于大文件，不要使用不支持切分整个文件的压缩格式，因为会失去数据的本地特性，造成MapReduce应用效率低下。
+
+### 5.3 序列化
+
+==序列化指将结构化对象转化为字节流以便在网络上传输或写到磁盘进行永久存储的过程。反序列化指将字节流转回结构化对象的逆过程。==
+
+序列化用于分布式数据处理两大领域：==进程通信和永久存储==
+
+在Hadoop中，系统中多个节点上进程间的通信时通过“远程过程调用”实现的。RPC协议将消息序列化成二进制流后发送到远程节点，远程节点紧接着将二进制流反序列化为原始消息。通常情况下，RPC序列化格式如下：
+
+①紧凑
+
+紧凑格式能充分利用网络带宽
+
+②快速
+
+进程间通信形成分布式系统的骨架，需要尽量减少序列化和反序列化的性能开销
+
+③可扩展
+
+满足新的需求，所以需要在控制客户端和服务器的过程中需要直接引进相应的协议
+
+④支持互操作
+
+对于某些系统来说，系统能支持已不用语言写的客户端与服务器交互
+
+#### 5.3.2 Writable类
+
+| JAVA基本类型 | Writable实现    | 序列化大小(字节) |
+| ------------ | --------------- | ---------------- |
+| boolean      | BooleanWritable | 1                |
+| byte         | ByteWritable    | 1                |
+| short        | ShortWritable   | 2                |
+| int          | IntWritable     | 4                |
+|              | VIntWritable    | 1~5              |
+| float        | FloatWritable   | 4                |
+| long         | LongWritable    | 8                |
+|              | VLongWritable   | 1~9              |
+| double       | DoubleWritable  | 8                |
+
+> `Writable`类对所有Java基本类型提供封装，`char`类型除外(可以存储在`IntWritable`中)。所有的封装包好`get()`和`set()`两个方法用于读取或存储封装的值。
+
+> 对整数进行编码时，有两种选择，即**定长格式(`IntWritable`和`LongWritable`)和变长格式(`VIntWritable`和`VLongWritable`)**，需要编码的数值如果相当小`[-127,127]`，变长格式只用一个字节进行编码，否则，使用第一个字节来表示数值的正负和后跟多少字节。
 
 
 
