@@ -473,13 +473,49 @@ map函数开始产生输出时，并不是简单地将他写到磁盘，它利�
 
 #### 7.3.2 reduce端
 
+- **reducer如何知道要从哪台集器取得map输出？**
+
+map任务成功完成后，它们会使用心跳机制通知它们的`application master`。因此，对于指定作业，`application master`知道map输出和主机位置之间的映射关系。reducer中的一个线程定期询问master以便获取map输出主机的位置，知道获得所有输出位置。由于第一个reducer可能失败，因此主机没有在第一个reducer检索到map输出时就立即从磁盘上删除它们。相反，主机会等待，知道`application master`告知它删除map输出，这是作业完成后执行的。
 
 
 
+如果map输出相当小，会被复制到reduce任务JVM的内存(缓冲区大小由`mapreduce.reduce.shuffle.input.buffer.percent`属性控制，指定用于此用途的对空间的百分比)，否则，map输出被复制到磁盘。一旦内存缓冲区达到阈值大小(由`mapreduce.reduce.merge.inmem.threshold`控制)，则合并后溢写到磁盘中。如果指定combiner，则在合并期间运行它以降低写入磁盘的数据量。
 
+随着磁盘上副本增多，后台线程会将它们合并为更大的，排好序的文件。这会为后面的合并节省一些时间。复制完所有map输出后，reduce任务进入排序阶段(更恰当的说法是合并阶段，因为排序是在map端进行)，这个阶段将合并map输出，维持其顺序排序。这是循环进行的。如，如果50个map输出，而合并因子是10(10为默认设置，由`mapreduce.task.io.sort.factor`属性设置)，合并将进行5次。每次将10个文件合并成一个文件，因此最后有5个中间文件。
 
+在最后阶段，即reduce阶段，直接把数据输入reduce函数，从而省略了一次磁盘往返行程，并没有将这5个文件合并成一个已排序的文件作为最后一趟。最后的合并可以来自内存和磁盘片段。
 
+#### 7.3.3 配置调优
 
+**map端调优属性**
+
+| 属性名称                              | 类型       | 默认值                                                       | 说明                                                         |
+| ------------------------------------- | ---------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| `mapreduce.task.io.sort.mb`           | int        | 100                                                          | 排序map输出时所使用的<br />内存缓冲区的大小，以MB为单位      |
+| `mapreduce.map.sort.spill.psercent`   | float      | 0.80                                                         | map输出内存缓冲和用来开始磁盘<br />溢出写过程的记录边界索引，这两<br />者使用比例的阈值 |
+| `mapreduce.task.io.sort.factor`       | int        | 10                                                           | 排序文件时，一次最多合并的流数。<br />这个属性也在reduce中使用。将此值<br />增加100很常见 |
+| `mapreduce.map.combine.minspills`     | int        | 3                                                            | 运行combiner所需的最少溢出文件数                             |
+| `mapreduce.map.output.compress`       | Boolean    | false                                                        | 是否压缩map输出                                              |
+| `mapreduce.map.output.compress.codec` | Class name | `org.apache.`<br />`hadoop.io.`<br />`compress.`<br />`DefaultCodec` | 用于map输出的压缩编解码器                                    |
+| `mapreduce.shuffle.max.threads`       | int        | 0                                                            | 每个节点管理器的工作线程数，用于将<br />map输出到reducer。   |
+
+>总的原则是给shuffle过程尽量多提供内存空间。然而，有一个平衡问题，也就是要确保map函数和reduce函数能得到足够的内存来运行。
+
+在map端，可以通过避免多次溢出写磁盘来获得最佳性能；一次是最佳的情况。如果能估算map输出大小，就可以合理设置`mapreduce.task.io.sort.*`属性来尽可能减少溢出写的次数。
+
+在reduce端，中间数据全部驻留在内存时，就能获得最佳性能。在默认情况下，这是不可能发生的，因为所有内存一般都预留给reduce函数。但如果reduce函数的内存需求不大，把`mapreduce.reduce.merge.inmem.threshold`设置为0，把`mapreduce.reduce.input.buffer.percent`设置为`1.0`就可以提升性能。
+
+**reduce端的调优属性**
+
+| 属性名称                                                     | 类型  | 默认值 | 描述                                                         |
+| ------------------------------------------------------------ | ----- | ------ | ------------------------------------------------------------ |
+| `mapreduce.reduce.`<br />`shuffle.parallelcopies`            | int   | 5      | 用于把map输出复制到reducer的线程数                           |
+| `mapreduce.reduce.`<br />`shuflle.maxfetchfailures`          | int   | 10     | 在声明失败之前，reducer获取一个map<br />输出所花的最大时间   |
+| `mapreduce.task.io.`<br />`sort.factor`                      | int   | 10     | 排序文件时一次最多合并的流的数量                             |
+| `mapreduce.reduce.`<br />`shuffle.input.bufer.`<br />`percent` | float | 0.70   | 在shuffle的复制阶段，分配给map<br />输出的缓冲区占堆空间的百分比 |
+| `mapreduce.reduce.`<br />`shuffle.merge.`<br />`percent`     | float | 0.66   | map输出缓冲区的阈值使用比例，<br />用于启动合并输出和磁盘溢出写的过程 |
+| `mapreduce.reduce.`<br />`merge.inmem.threshold`             | int   | 1000   | 启动合并输出和磁盘溢出写过程的map<br />输出的阈值数。        |
+| `mapreduce.reduce.input.`<br />`buffer.percent`              | float | 0.0    | 在reduce过程中，在内存中保存map输出的空间占<br />整个堆空间的比例。reduce阶段开始时，内存中map<br />输出大小不能大于这个值。默认情况下，在reduce任务<br />开始之前，所有map输出都合并到磁盘上，以便为reducer<br />提供尽可能多的内存。然而，如果reducer需要的内存较少，<br />可以增加此值来最小化访问磁盘次数。 |
 
 
 
