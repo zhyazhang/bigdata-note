@@ -517,15 +517,172 @@ map任务成功完成后，它们会使用心跳机制通知它们的`applicatio
 | `mapreduce.reduce.`<br />`merge.inmem.threshold`             | int   | 1000   | 启动合并输出和磁盘溢出写过程的map<br />输出的阈值数。        |
 | `mapreduce.reduce.input.`<br />`buffer.percent`              | float | 0.0    | 在reduce过程中，在内存中保存map输出的空间占<br />整个堆空间的比例。reduce阶段开始时，内存中map<br />输出大小不能大于这个值。默认情况下，在reduce任务<br />开始之前，所有map输出都合并到磁盘上，以便为reducer<br />提供尽可能多的内存。然而，如果reducer需要的内存较少，<br />可以增加此值来最小化访问磁盘次数。 |
 
+### 7.4 任务的执行
 
 
 
+## 8 MapReduce的类型与格式
 
+MapReduce数据处理模型非常简单:Map和Reduce函数的输入和输出时键-值对。
 
+### 8.1 MapReduce的类型
 
+Hadoop的MapReduce中，map函数和reduce函数遵循如下常规格式：
 
+```
+map:(K1,V1) -> list(K2,V2)
+reduce:(K2,list(V2))->list(K3,V3)
+```
 
+## 9 MapReduce的特性
 
+### 9.1 计数器
+
+计数器是收集作业统计信息的有效手段之一，用于质量控制或应用级统计。计数器还可辅助诊断系统故障。如果需要将日志信息传输到map或reduce任务，更好的方法通常是看能否用一个计数器值来记录某一特定事件的发生。
+
+### 9.3 排序
+
+排序是mapreduce的核心技术。尽管应用本身可能并不需要对数据排序，但仍可能使用mapreduce的排序功能来组织数据。
+
+### 9.4 边数据分布
+
+边数据是作业所需的额外的只读数据，以辅助处理主数据集。所面临的挑战在于如何使所有map或reduce任务都能够方便而高效地使用边数据。
+
+#### 9.4.2 分布式缓存
+
+与在作业配置中序列化边数据的技术相比，Hadoop的分布式缓存机制更受青睐，它能够在任务运行过程中及时地将文件和存档复制到任务节点以供使用。为了节约网络带宽，在每个作业中，各个文件通常只需要复制到一个节点一次。
+
+## 10 构建Hadoop集群
+
+### 10.1 集群规范
+
+- 为什么不使用RAID?
+
+尽管建议采用RAID(`Redundant Array of Independent Disk`，即磁盘阵列)作为namenode地存储器以保护元数据，但是若将RAID作为datanode的存储设备则不会给HDFS带来溢出。HDFS所提供的节点间数据复制技术已可满足数据备份需求，无需使用RAID的冗余机制。
+
+此外，尽管RAID条带化技术(`RAID 0`)被广泛用于提升性能，但是其速度仍然比用在HDFS里的JBOD(Just a Bunch of Disks)配置慢。JBOD在所有磁盘之间循环调度HDFS块。`RAID 0`的读/写操作受限于磁盘阵列中响应最慢的盘片的速度，而JBOD的磁盘操作均独立，因而平均读/写速度高于最慢盘片的读/写速度。需要强调的是，各个磁盘的性能在实际使用中总存在相当大的差异，即使对相同型号的磁盘。在一些针对某一雅虎集群的基准评测中，在一项测试中，JBOD比RAID 0快10%；在另一测试(HDFS写吞吐量)中，JBOD比RAID 0快30%。
+
+最后，若JBOD配置的某一磁盘出现故障，HDFS可以忽略该磁盘，继续工作。而RAID的某一盘片故障会导致整个磁盘阵列不可用，进而使相应节点失效。
+
+#### 10 .1.1 网络拓扑
+
+>为了达到Hadoop的最佳性能，配置Hadoop系统以让其了解网络拓扑状况就极为关键。如果一个集群只包含一个机架，就无需做什么，因为这是默认配置。但是对于多机架的集群来说，描述清楚节点-机架的映射关系就很有必要。这使得将MapReduce任务分配到各个节点时，会倾向于执行机架内的数据传输，而非跨机架数据传输。HDFS还能够更加智能地放置复本，以取得性能和弹性地平衡。
+
+大多数安装并不需要自己实现接口，只需要使用默认地`ScriptBasedMapping`实现即可，它运行用户定义地脚本描述映射关系。脚本地存放路径由属性`net.topology.script.file.name`控制。脚本接受一系列输入参数，描述带映射地主机名称或IP地址，再将相应的网络位置以空格分开，输出到标准输出。
+
+**Topology Script**
+
+```shell
+HADOOP_CONF=/etc/hadoop/conf 
+
+while [ $# -gt 0 ] ; do
+  nodeArg=$1
+  exec< ${HADOOP_CONF}/topology.data 
+  result="" 
+  while read line ; do
+    ar=( $line ) 
+    if [ "${ar[0]}" = "$nodeArg" ] ; then
+      result="${ar[1]}"
+    fi
+  done 
+  shift 
+  if [ -z "$result" ] ; then
+    echo -n "/default/rack "
+  else
+    echo -n "$result "
+  fi
+done 
+```
+
+**Topology data**
+
+```
+hadoopdata1.ec.com     /dc1/rack1
+hadoopdata1            /dc1/rack1
+10.1.1.1               /dc1/rack2
+```
+
+### 10.3 Hadoop配置
+
+#### 10.3.2 环境配置
+
+**一个守护进程需要多少内存？**
+
+由于namenode会在内存中维护所有文件的每个数据块的引用，因此namenode很可能会吃光分配给他的所有内存。很难用一个公式来精确计算内存需求量，因为内存需求量取决于多个因素，包括每个文件包含的数据块数、文件名称的长度、文件系统中的目录数等。因此，在不同和Hadoop版本下namenode的内存需求也不相同。
+
+1000MB内存通常足够管理数百万个文件，但是根据经验来看，保守估计需要为每1百万个数据块分配1000MB内存空间。
+
+#### 10.3.4 Hadoop守护进程的地址和端口
+
+Hadoop守护进程一般同时运行RPC和HTTP两个服务器，RPC服务器支持守护进程间的通信，HTTP服务器则提供与用户交互的Web页面。需要分别为两个服务器配置网络地址和监听端口号。端口号0表示服务器会选择一个空闲的端口号(这种做法与集群范围的防火墙策略不兼容，不推荐)。
+
+通常，用于设置服务器RPC和HTTP地址的属性担负着双重责任：一方面它们决定了服务器将绑定的网络接口，另一方面，客户端或集群中的其它集器使用它们连接的服务器。
+
+用户经常希望服务器同时可以绑定多个网络接口，将网络地址设为0.0.0.0 可以达到这个目的，但是却破坏了上述第二种情况，因为这个地址无法被客户端或集群中的其它机器解析。一种解决方案是将客户端和服务器的配置分开，但是更好的一种方案是为服务器绑定主机。通过将`yarn.resourcemanager.hostname`设定为主机名或IP地址,`yarn.resourcemanager.bind-host`设定为0.0.0.0，可以确保资源管理器能够与主机上的所有地址绑定，且同时能为节点管理器和客户端提供可解析的地址。
+
+除了RPC服务器之外，各个datanode还运行TCP/IP服务器以支持块传输。服务器地址和端口号由属性`dfs.datanode.address`设定，默认值是0.0.0.0:50010。
+
+有多个网络接口时，还可以为各个datanode选择某一个网络接口作为IP地址。相关属性是`dfs.datanode.dns.interface`，默认值是default,表示使用默认的网络接口。
+
+#### 10.3.5 Hadoop的其它属性
+
+1 集群成员
+
+为了便于在将来添加或移除节点，可以通过文件来指定一些允许作为datanode或节点管理器加入集群的经过认证的集器。
+
+属性`dfs.hosts`记录允许作为datanode加入集群集器列表；属性`yarn.resourcemanager.nodes.include-path`记录允许作为节点管理器加入集群的机器列表。与之相对应的，属性`dfs.hosts.exclude`和`yarn.resourcemanager.nodes.exclude-path`所指定的文件分别包含待解除的集器列表。
+
+2 缓冲区大小
+
+Hadoop使用一个4KB的缓冲区辅助I/O操作。增大缓冲区容量会显著提高性能，可以通过core-site.xml文件中的`io.file.buffer.size`属性来设置缓冲区大小。
+
+3 HDFS块大小
+
+在默认情况下，HDFS块大小是128MB，但是许多集器把块大小设的更大以降低namenode的内存压力，并向mapper传输更多数据。可以通过hdfs-site.xml文件中的`dfs.blocksize`属性设置块的大小。
+
+4 保留的存储空间
+
+默认情况下，datanode能够使用存储目录上的所有闲置空间。如果计划将部分空间留给其它应用程序，则需要设置`dfs.datanode.du.reserved`属性来指定保留的空间大小。
+
+5 回收站
+
+Hadoop文件系统也有回收站设施，被删除的文件并未被真正删除，进只转移到回收站中。回收站中的文件在被永久删除之前仍会至少保留一段时间。该信息由core-site.xml文件中的`fs.trash.interval`属性设置。默认情况下，属性的值是0，表示回收站特性无效。
+
+## 11 管理Hadoop
+
+### 11.1 HDFS
+
+**1 namenode的目录结构**
+
+`dfs.namenode.name.dir`属性描述一组目录，各个目录存储着镜像内容。
+
+`VERSION`文件是一个Java属性文件，其中包含正在运行的HDFS的版本信息：
+
+```
+#Sat Dec 04 19:08:42 CST 2021
+namespaceID=1178194806
+clusterID=CID-b51dd45c-2cd2-4153-a536-392087eaf029
+cTime=1626174934160
+storageType=NAME_NODE
+blockpoolID=BP-1028710730-192.168.10.102-1626174934160
+layoutVersion=-65
+```
+
+`layoutVersion`是一个负整数，描述HDFS持久性数据结构的版本。只要布局变更，版本号便会递减，此时，HDFS也需要升级，否则，磁盘仍然使用旧版本的布局，新版本的namenode就无法正常工作。
+
+`namespaceID`是文件系统命名空间的唯一标识符，是在namenode首次格式化创建的。
+
+`clusterID`是将HDFS集群作为一个整体赋予的唯一标识符，对于联邦HDFS非常重要，这里一个集群由多个命名空间组成，且每个命名空间由一个namenode管理。
+
+`blockpoolID`是数据块池的唯一标识符，数据块池中包含了由一个namenode管理的命名空间中的所有文件。
+
+`cTime`属性标记了namenode存储系统的创建时间。对于刚刚初始化的存储系统，这个属性值为0；但在文件系统升级之后，该值会更新到新的时间戳。
+
+`storageType`属性说明该存储目录包含的是namenode的数据结构。
+
+**2 文件系统映像和编辑日志**
+
+文件系统客户端执行写操作时，这些事务首先被记录到编辑日志中，namenode在内存中维护文件系统的元数据，当编辑日志被修改时，相关元数据信息也同步更新。内存中的元数据可支持客户端的读请求。
 
 
 
