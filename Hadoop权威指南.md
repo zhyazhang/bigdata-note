@@ -684,6 +684,107 @@ layoutVersion=-65
 
 文件系统客户端执行写操作时，这些事务首先被记录到编辑日志中，namenode在内存中维护文件系统的元数据，当编辑日志被修改时，相关元数据信息也同步更新。内存中的元数据可支持客户端的读请求。
 
+编辑日志在概念上时单个实体，但是它体现为磁盘上的多个文件。每个文件称为一个段(`segment`)，名称由前缀edits及后缀组成，后缀指示出该文件所包含的事务ID。任一时刻只有一个文件处于打开可写状态，在每个事务完成之后，且在向客户端发送成功代码之前，文件都需要更新并同步到每个复本之后方可返回成功代码，以确保任何事务都不会因为机器故障而丢失。
+
+每个fsimage文件都是文件系统元数据的一个完整的永久性检查点。并非每一个写操作都会更新该文件，因为fsimage是一个大型文件，如果频繁地执行写操作，会使系统运行极为缓慢。但这个特性根本不会降低系统的恢复能力，因为如果namenode发生故障，最近的fsimage文件将被载入到内存以重构元数据的最近状态，再从相关点开始向前执行编辑日志中记录的每个事务。
+
+> 每个fsimage文件包含文件系统中的所有目录和文件inode的序列化信息。每个inode是一个文件或目录的元数据的内部描述。对于文件来说，包含的信息有“复制级别”、修改时间和访问时间、访问许可、块大小、组成一个文件的块等。对于目录文件来说，包含的信息有修改时间、访问许可和配额元数据等信息。
+>
+> 数据块存储在datanode中，但fsimage文件并不描述datanode。取而代之的是，namenode将这种块映射关系放在内存中。当datanode加入集群时，namenode向datanode索取块列表以建立块映射关系；namenode还将定期征询datanode以确保它拥有最新的块映射。
+
+编辑日志会无限增长，尽管这种情况对于namenode的运行没有影响，但由于需要恢复编辑日志中的各项事务，namenode的重启操作会比较慢。解决方案是运行辅助namenode，为主namenode内存中的文件系统元数据创建检查点。创建检查点的步骤如下：
+
+1. 辅助namenode请求主namenode停止使用正在进行中的edits文件，这样新的编辑操作记录到一个新文件中。主namenode还会更新所有存储目录中的seen_txid文件。
+2. 辅助namenode从主namenode获取最近的fsimage和edits文件(采用HTTP GET)。
+3. 辅助namenode将fsimage文件载入内存，逐一执行edits文件中的事务，创建新的合并后后的fsimage文件。
+4. 辅助namenode将新的fsimage文件发送回主namenode(使用HTTP PUT)，主namenode将其保存为临时的`.ckpt`文件。
+5. 主namenode重新命名临时的fsimage文件。
+
+最终，主namenode拥有最新的fsimage文件和一个更小的正在进行中的edits文件。当namenode处在安全模式时，管理员也可调用`hdfs dfsadmin -saveNamespace`命令来创建检查点。
+
+**检查点触发的条件？**
+
+通常情况下，辅助namenode每隔一个小时(由`dfs.namenode.checkpoint.period`属性设置，以每秒为单位)创建检查点；此外，如果从上一个检查点开始编辑日志的大小已经达到100万个事务(由`dfs.namenode.checkpoint.txns`属性设置)时，那么即使不到一小时，也会创建检查点，检查频率为每分钟一次(由`dfs.namenode.checkpoint.check.period`属性设置，以秒为单位)。
+
+**3 辅助namenode的目录结构**
+
+辅助namenode的检查点目录(`dfs.namenode.checkpoint.dir`)的布局和主`namenode`的检查点目录的布局相同。这种设计方案的好处是，在主namenode发生故障时，可以从辅助namenode恢复数据。有两种实现方法。方法一是将相关存储目录复制到新namenode中；方法二是使用`-importCheckPoint`选项启动namenode守护进程，从而将辅助namenode用作新的主namenode。借助该选项，仅当`dfs.namenode.name.dir`属性定义的目录中没有元数据时，辅助namenode会从`dfs.namenode.checkpoint.dir`属性定义的目录载入最新的检查点namenode元数据。
+
+**4 datanode的目录结构**
+
+datanode的存储目录时初始阶段自动创建的，不需要额外格式化。
+
+HDFS数据块存储在以`blk_`为前缀的文件中，文件名包含了该文件存储的块原始字节数。每个块有一个相关联的带有`.meta`后缀的元数据文件。元数据文件包括头部和该块各区段的一系列的校验和。
+
+每个块属于一个数据块池，每个数据块池都有自己的存储目录，目录根据数据块ID形成，当目录中数据块的数量增加到一定规模时，datanode会创建一个子目录来存放新的数据块及其元数据信息。如果当前目录已经存储了64个(通过`dfs.datanode.numblocks`属性设置)数据块时，就会创建一个子目录。
+
+**11.1.2 安全模式**
+
+namenode启动时，首先将映像文件载入内存，并执行编辑日志中的各项操作。一旦在内存中成功建立文件系统元数据的映像，则创建一个新的fsimage文件和一个空的编辑日志，在这个过程中，namenode运行在安全模式，意味着namenode的文件系统对于客户端来说是只读的。
+
+系统中数据块的位置并不是由namenode维护的，而是以块裂变的形式存储在datanode中。在系统的正常操作期间，namenode会在内存中保留所有块位置的映射信息。在安全模式下，各个datanode会向namenode发送最新的块列表信息，namenode了解到足够的块位置信息后，即可高效运行文件系统。如果namenode认为向其发送更新信息的datanode节点过少，则它会启动块复制进程，以将数据块复制到新的datanode节点。然而，在大多数情况下上述操作都是不必要的，并浪费了集群的资源，实际上，在安全模式下namenode并不向datanode发出任何块复制或块删除命令。
+
+如果满足“最小复本条件”，namenode会在30秒之后就退出安全模式，所谓的`最小复本条件指的是在整个文件系统中有99.9%的块满足最小复本级别(默认1，dfs.namenode.replication.min属性设置)`
+
+### 11.2 监控
+
+#### 11.2.2 度量和JMX
+
+Hadoop守护进程收集事件和度量相关的信息，这些信息统称为“度量”，例如各个datanode会收集以下度量：写入的字节数，块的副本数和客户端发起的读操作请求时。
+
+**度量和计数器的差别在哪里？**
+
+主要区别是应用范围不同：度量由Hadoop守护进程收集，而计数器先针对MapReduce任务进行采集，再针对整个作业进行汇总。此外，用户群也不同，从广义上讲，度量为管理员服务，而计数器主要为MapReduce用户服务。
+
+二者的数据采集和聚合过程也不同。计数器是MapRedu的特性，MapReduce系统确保计数器值由任务JVM产生，再传回application master，最终传回运行MapReduce作业的客户端。再整个过程中，任务进程和application master都会执行汇总操作。
+
+度量的收集机制独立于接受更新的组件，有多种输出度量的方式，包括本地文件Ganglia和JMX。守护进程收集度量，并在输出之前执行汇总操作。
+
+### 11.3 维护
+
+#### 11.3.2 委任和解除节点
+
+**1 委任新节点**
+
+委任一个新节点非常简单。首先，配置hdfs-site.xml文件，指向namenode；其次，配置yarn-site.xml文件，指向资源管理器；最后，启动datanode和资源管理器守护进程。
+
+向集群添加新节点的步骤如下：
+
+1. 将新节点的网络地址添加到include文件中
+2. 运行以下指令，将审核过的一系列datanode集合更新至namenode信息：`% hdfs dfsadmin -refreshNodes`
+3. 运行以下命令，将审核过的一系列节点管理器信息更新至资源管理器：`% yarn rmadmin -refreshNodes`
+4. 以新节点更新slaves文件。Hadoop控制脚本会将新节点包括在未来操作之中。
+5. 启动新的datanode和节点管理器。
+6. 检查新的datanode和节点管理器是否都出现在网页界面中。
+
+HDFS不会自动将块从旧的datanode移到新的datanode以平衡集群。用户需要自行运行均衡器。
+
+**2 解除旧节点**
+
+HDFS能够容忍datanode故障，但这并不意味着允许随意终止datanode。以三副本策略为例，如果同时关闭不同机架上的三个datanode，则数据丢失的概率会非常高。正确的方法是，用户将拟退出的若干datanode告知namenode，Hadoop系统就可在这些datanode停机之前将块复制到其它datanode。
+
+从集群中移除节点的步骤为：
+
+1. 将待解除节点的网络地址添加到exclude文件中，不更新include文件
+2. 执行以下命令，使用一组新的审核过的datanode来更新namenode设置：`%hdfs dfsadmin -refreshNodes`
+3. 使用一组新的审核过的节点管理器来更新资源管理器设置：`% yarn rmadmin -refreshNodes`
+4. 转到网页界面，查看待解除datanode的管理状态是否已经变成“正在解除”(`Decommission In Progress`)，因为此时相关的datanode正在被解除过程之中。这些datanode会把它们的块复制到其它datanode中。
+5. 当所有datanode的状态变为“解除完毕”(`Decommissioned`)时，表明所有块都已经复制完毕关闭已经解除的节点。
+6. 从include文件中移除这些节点，并允许以下命令：`% hdfs dfsadmin -refreshNodes`  `% yarn rmadmin -refreshNodes`
+7. 从slaves文件中移除节点。
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
