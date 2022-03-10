@@ -257,7 +257,31 @@ YARN提供请求和使用集群资源的API，但这些API很少直接用于用�
 
 ![yarn_application](images/yarn_application.png)
 
+基础架构：
 
+YARN主要由ResourceManager、NodeManager、ApplicatioinMaster和Container等组件构成。
+
+ResourceManager主要作用如下：
+
+1. 处理客户端请求
+2. 监控NodeManager
+3. 启动或监控ApplicationMaster
+4. 资源的分配和调度
+
+NodeManager主要作用如下：
+
+1. 管理单个节点上的资源
+2. 处理来自ResourceManager的命令
+3. 处理来自ApplicationMaster的命令
+
+ApplicationMaster作用如下：
+
+1. 为应用程序申请资源并分配给内部任务
+2. 人物的监控和容错
+
+Container：
+
+Container是YARN中的资源抽象，它封装了某个节点上的多维度资源，如内存、CPU、磁盘、网络等。
 
 ### 4.1 剖析YARN应用运行机制
 
@@ -326,6 +350,38 @@ YARN的最大优点在于向MapReduce以外的其它类型的分布式应用开�
 - **如果一个用户的应用对CPU的需求很大，但对内存的需求量很少，而另一个用户需要很少的CPU，但对内存需求量很大，那么如何比较这两个应用？**
 
 YARN中调度器解决这个问题的思路是，观察每个用户的主导资源，并将其作为对集群资源使用的度量，次方法称为**主导资源公平性**(Dominant Resource Fairness,DRF)
+
+
+
+#### 4.4 作业提交全过程
+
+作业提交全过程详解：
+
+1. 作业提交
+   - Client调用`job.waitForCompletion`方法，向整个集群提交MapReduce作业。
+   - Client向RM申请一个作业id
+   - RM给Client返回该job资源的提交路径和作业id
+   - Client提交jar包、切片信息和配置文件到指定的资源提交路径
+   - Client提交完资源后，向RM申请运行MrAppMaster。
+2. 作业初始化
+   - 当RM收到Client的请求后，将该job添加到容量调度器中
+   - 某个空闲的NM领取到该Job
+   - 该NM创建Container，并产生MRAppmaster
+   - 下载Client提交的资源到本地
+3. 任务分配
+   - MrAppMaster向RM申请运行多个MapTask任务资源
+   - RM将运行MapTask任务分配给另外两个NodeManager，另两个NodeManager分别领取任务并创建容器
+4. 任务运行
+   - MR向两个接收到任务的NodeManager发送程序启动脚本，这两个NodeManager分别启动MapTask，MapTask对数据分区排序
+   - MrAppMaster等待所有MapTask运行完毕后，向RM申请容器，运行ReduceTask
+   - ReduceTask向MapTask获取相应分区的数据
+   - 程序运行完毕后，MR会向RM申请注销自己
+5. 进度和状态更新
+   - YARN中的任务将其进度和状态返回给应用管理器，客户端每秒向应用管理器请求更新进度，展示给用户
+6. 作业完成
+   - 除了向应用管理器请求作业进度外，客户端每5秒都会通过调用waitForCompletion()来检查作业是否完成。时间间隔可以通过`mapreduce.client.completion.pollinterval`来设置。作业完成之后，应用管理器和Container会清理工作状态。作业的信息会被历史服务器存储以备之后用户检查。
+
+
 
 ## 5 Hadoop的I/O操作
 
