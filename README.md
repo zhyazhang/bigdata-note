@@ -38,6 +38,103 @@ MapReduce作业是客户端需要执行的一个工作单元：它包括输入�
 
 map的输出是中间结果：该中间结果由reduce任务处理后才产生最终输出结果，而且一旦作业完成，map的输出结果就可以删除。如果运行map任务的节点在将map中间结果传送给reduce任务之前是失败，hadoop将在另一个节点上重新运行这个map任务以再次构建map中间结果。
 
+### 2.1MapReduce1工作机制
+
+工作角色：客户端、jobtracker（协调作业）、tasktracker（执行任务）。
+
+**jobtracker**：整个计算程序的老大，负责资源调度，但是是随机调度的，监控程序运行的状态，还要启动运行程序，但jobtracker存在单点故障问题。
+
+**tasktracker**：负责计算程序的执行，强行的把计算资源分成两部分：mapslot、reduceslot，map任务跑在mapslot上，reduce任务跑在reduceslot上。每一部分资源只能跑在对应的任务上
+
+缺陷：
+
+1. 单点故障
+2. 资源调度随机，造成资源浪费
+3. jobtracker的运行压力过大
+
+<img src="images/mr1.png" style="zoom: 33%;" />
+
+**提交资源：**
+
+1. 客户端启动一个job。
+
+2. 客户端向jobtracker请求一个新作业，检查作业输出路径是否存在，存在则抛出异常。随后，jobtracker向客户端返回一个作业ID和资源提交路径。
+3. 客户端将job所需资源（jar文件、xml文件、分片信息等）提交到指定路径（一般是HDFS共享文件系统）。
+4. 客户端向jobtracker提交job。
+
+**作业调度：**
+
+1. jobtracker将提交的job放入内部的任务队列，作业调度器进行调度，初始化作业。（创建一个表示正在运行作业的对象，用来封装任务和记录信息。）
+2. jobtracker的作业调度器从hdfs共享文件系统中获取客户端分片信息，创建任务执行任务列表。（map任务、reduce任务、作业清理任务等）
+3. 多个tasktracker通过心跳与jobtracker进行通信，分配任务，报告是否准备接受任务，若准备好，则jobtracker分配任务给tasktracker。
+
+**运行任务：**
+
+1. tasktracker在共享文件系统中获取任务信息，实现jar文件本地化，将jar解压到工作目录，创建TaskRunner实例。
+2. TaskRunner启动一个新的JVM。
+3. 运行map/reduce。
+4. 状态更新：tasktracker向jobtracker通过心跳发送状态，jobtracker合并后发给客户端。
+
+### 2.2MapReduce2工作机制
+
+**鉴于以上缺陷，在hadoop2.x中，把hadoop1.x中的mapreduce分成两部分：**
+
+1. `mapreduce`：负责计算
+2. `yarn`:专门负责资源调度
+
+**yarn(主从架构)**
+
+`resourcemanager`：整个资源调度的老大
+
+1. 接收客户端的请求 该请求是运行程序的请求
+2. 启动和监控`MRAppMaster`
+3. 接收`nodemanager`的状态报告 `nodemanager`的资源状态和存活状态
+4. 资源调度，整个计算程序的资源调度：决定运行资源和跑在哪个节点
+
+`nodemanager`：负责真正的提供资源，运行计算程序
+
+1. 接收`resourcemanager`的命令
+2. 管理单个结点上的资源
+3. 提供资源运行计算程序
+4. 处理来自`MRAppMaster`的命令
+
+**启动计算和资源调度时的常见概念：**
+
+`MRAppMaster`:单个计算程序的老大，负责帮助计算程序向`resourcemanager`申请资源。
+
+负责启动`maptask`和`reducetask`任务，监控`maptask`和`reducetask`的运行进度。类似于项目经理。
+
+`ASM：applicationsmanager `所有应用程序的管理者，负责调度应用程序。
+
+container：抽象资源容器，封装着一定的cpu、io和网络等资源，是运行`maptask`和`reducetask`的运行资源单位，
+
+> 1个split---->1maptask--->1container--->yarnchild 一个划分对应一个maptask，需要一个container资源，对应一个yarnchild进程。
+
+`scheduler`：决定调度什么时候执行哪个计算程序(即job执行顺序)
+
+调度器：
+
+> FIFO：先提交的程序先执行，后提交的程序后执行，通过内部维护一个队列实现
+>
+> FATR：公平调度器，大家平分资源运行，通过内部维护多个队列实现，多个队列之间进行资源分配，程序之间平均分配资源
+>
+> CAPICITY：按需进行资源配置，两个队列：第一个队列：60%，40%，在每个队列都是先进先出
+
+<img src="images/mr2.png" style="zoom: 33%;" />
+
+1. 客户端启动一个job。
+2. 客户端向`resourcemanager`请求一个新作业，随后，`resourcemanager`向客户端返回一个作业ID和资源提交路径。
+3. 客户端将job所需资源（jar文件、xml文件、分片信息等）提交到指定路径（一般是HDFS共享文件系统）。
+4. 客户端向`resourcemanager`提交job。
+5. `resourcemanager`通过作业调度器在`nodemanager`上创建一个容器，容器中启动`MRAppMaster`进程（这个进程由`resourcemanager`启动）。
+6. `MRAppMaster`对作业进行初始化，创建多个对象进行跟踪。
+7. `MRAppMaster`获取分片信息，每个分片创建map任务和指定的reduce`任务`。若作业很小，会与`MRAppMaster`在同一个JVM上运行（少于10个mapper且只有一个reducer输出大小小于一个hdfs块，则作为uber任务运行）。
+8. 若作业很大，`MRAppMaster`为所有map和reduce申请容器资源。请求包括map数据本地化信息和输入分片信息等。
+9. 容器分配好之后，`MRAppMaster`通过与`nodemanager`通信启动容器，由`MRAppMaster`负责分配在哪些`nodemanager`上运行map和reduce任务（YarnChilde进程）。
+10. `nodemanager`获取job相关资源。
+11. **运行map和reduce任务。**
+12. 状态更新：任务状态周期性向`MRAppMaster`汇报，客户端定期查询`MRAppMaster`获取任务状态。
+
 ## 3 Hadoop分布式文件系统
 
 ### 基本知识
