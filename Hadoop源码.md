@@ -266,25 +266,258 @@ private volatile GSet<Block,BlockInfo> blocks;
 
 当活动的`Namenode`成功获取并更新了`epoch number`后，调用任何修改`editlog`的`RPC`请求都必须携带`epoch number`。当`RPC`请求到达`JN`后（除了`newEpoch()`请求），`JN`会将请求者的`epoch number`与自己保存的`lastPromisedEpoch`变量做比较，如果请求者的`epoch number`更大，`JN`就会更新自己的`lastPromisedEpoch`变量，并执行对应的操作：如果请求者的`epoch number`更小，`JN`就会拒绝这次请求。当集群中的大多数`JN`拒绝了请求时，这次操作就失败了。考虑如下情况，当HDFS集群发生Namenode错误切换后，原来`Standby Namenode`会将集群的`epoch number`加`1`之后更新。这样原来的`Active Namenode`的`epoch number`肯定小于这个值，当这个节点执行写`editlog`操作时，由于`JN`节点不接收`epoch number`小于`lastPromisedEpoch`的写请求，所以这次写请求会失败，也就达到了`fencing`的目的。
 
+#### 3.7.3 名字节点的启动
+
+`Namenode`实体在代码实现中主要对应于三个类，即`NameNode`类、`NameNodeRpcServer`类以及`FSNamesystem`类。
+
+1. `NameNodeRpcServer`类用于接收和处理所有的`RPC`请求，
+2. `FSNamesystem`类负责实现`Namenode`的所有逻辑，
+3. `NameNode`类则负责管理`Namenode`配置、`RPC`接口以及`HTTP`接口等。
 
 
 
+`createNameNode()`方法会根据启动`Namenode`时传入的启动选项，调用对应的方法执行操作。
+
+1. `FORMAT`:格式化当前`Namenode`,调用`format()`方法执行格式化操作。
+2. `GENCLUSTERID`:产生新的`clusterID`。`clusterID`是集群的持久属性。它在创建集群时生成，并在集群的生命周期中保持不变。当一个新的名称节点被格式化时，如果这是一个新的集群，则会生成并存储一个新的`clusterID`
+3. `ROLLBACK`:回滚上一次升级，调用`doRollback()`方法执行回滚操作。
+4. `BOOTSTRAPSTANDBY`:拷贝`Active Namenode`的最新命名空间数据到`Standby Namenode`,调用`BootstrapStandby.run()`方法执行操作。
+5. `INITIALIZESHAREDEDITS`:初始化`editlog`的共享存储空间，并从`Active Namenode`中拷贝足够的`editlog`数据，使得`Standby`节点能够顺利启动。这里调用了静态`initializeSharedEdits()`执行操作。
+6. `BACKUP`:启动`backup`节点，这里直接构造一个`BackupNode`对象并返回。
+7. `CHECKPOINT`:启动`checkpoint`节点，也是直接构造`BackupNode`对象并返回。
+8. `RECOVER`:恢复损坏的元数据以及文件系统，这里调用了`doRecovery()`方法执行操作。
+9. `METADATAVERSION`:确认配置文件夹存在，并且打印`fsimage`文件和文件系统的元数据版本。
+10. `UPGRADEONLY`:升级`Namenode`,升级完成后关闭`Namenode`。
+11. 默认情况：其他所有选项的执行都是直接通过`NameNode`的构造方法构造`NameNode`对象，并返回的。
+
+`NameNode.initialize()`方法流程，构造`HTTP`服务器，构造`RPC`服务器，初始化`FSNamesystem`对象，最后调用`startCommonServices()`启动`HTTP`服务器、`RPC`服务器。
+
+```java
+protected void initialize(Configuration conf) throws IOException {
+  if (conf.get(HADOOP_USER_GROUP_METRICS_PERCENTILES_INTERVALS) == null) {
+    String intervals = conf.get(DFS_METRICS_PERCENTILES_INTERVALS_KEY);
+    if (intervals != null) {
+      conf.set(HADOOP_USER_GROUP_METRICS_PERCENTILES_INTERVALS,
+        intervals);
+    }
+  }
+
+  UserGroupInformation.setConfiguration(conf);
+  loginAsNameNodeUser(conf);
+
+  NameNode.initMetrics(conf, this.getRole());
+  StartupProgressMetrics.register(startupProgress);
+
+    //构造JvmPauseMonitor对象并启动
+    //该类设置了一个简单的线程，该线程在循环中运行，在很短的时间间隔内睡眠。
+    //如果睡眠时间明显长于其目标时间，这意味着JVM或主机暂停了处理，这可能会导致其他问题。如果检测到这样的暂停，该线程会记录一条信息。
+  pauseMonitor = new JvmPauseMonitor();
+  pauseMonitor.init(conf);
+  pauseMonitor.start();
+  metrics.getJvmMetrics().setPauseMonitor(pauseMonitor);
+
+    //启动HTTP服务器
+  if (NamenodeRole.NAMENODE == role) {
+    startHttpServer(conf);
+  }
+
+    //初始化FSNamenode
+    //调用 FSNamesystem.loadFromDisk(conf);
+  loadNamesystem(conf);
+  startAliasMapServerIfNecessary(conf);
+
+    //创建RPC服务
+  rpcServer = createRpcServer(conf);
+
+  initReconfigurableBackoffKey();
+
+  if (clientNamenodeAddress == null) {
+    // This is expected for MiniDFSCluster. Set it now using 
+    // the RPC server's bind address.
+    clientNamenodeAddress = 
+        NetUtils.getHostPortString(getNameNodeAddress());
+    LOG.info("Clients are to use " + clientNamenodeAddress + " to access"
+        + " this namenode/service.");
+  }
+  if (NamenodeRole.NAMENODE == role) {
+    httpServer.setNameNodeAddress(getNameNodeAddress());
+    httpServer.setFSImage(getFSImage());
+  }
+
+    //启动active和standby状态的共同服务
+  startCommonServices(conf);
+    //启动计时器，定期将NameNode指标写入日志文件
+  startMetricsLogger(conf);
+}
+```
+
+`FSNamesystem.loadFromDisk()`首先调用构造方法构造`FSNamesystem`对象，然后将`fsimage`以及`editlog`文件加载到命名空间中：
+
+```java
+static FSNamesystem loadFromDisk(Configuration conf) throws IOException {
+
+  checkConfiguration(conf);
+  FSImage fsImage = new FSImage(conf,
+      FSNamesystem.getNamespaceDirs(conf),
+      FSNamesystem.getNamespaceEditsDirs(conf));
+    //创建FSNamesystem对象
+  FSNamesystem namesystem = new FSNamesystem(conf, fsImage, false);
+  StartupOption startOpt = NameNode.getStartupOption(conf);
+  if (startOpt == StartupOption.RECOVER) {
+    namesystem.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+  }
+
+  long loadStart = monotonicNow();
+  try {
+      //加载fsimage、editlog文件到内存
+    namesystem.loadFSImage(startOpt);
+  } catch (IOException ioe) {
+    LOG.warn("Encountered exception loading fsimage", ioe);
+    fsImage.close();
+    throw ioe;
+  }
+  long timeTakenToLoadFSImage = monotonicNow() - loadStart;
+  LOG.info("Finished loading FSImage in " + timeTakenToLoadFSImage + " msecs");
+  NameNodeMetrics nnMetrics = NameNode.getNameNodeMetrics();
+  if (nnMetrics != null) {
+    nnMetrics.setFsImageLoadTime((int) timeTakenToLoadFSImage);
+  }
+  namesystem.getFSDirectory().createReservedStatuses(namesystem.getCTime());
+  return namesystem;
+}
+```
+
+## 第四章 Datanode
+
+`Datanode`以存储数据块(`Block`)的形式保存HDFS`文件`，同时`Datanode`还会响应`HDFS`客户端读、写数据块的请求。`Datanode`会周期性地向`Namenode`上报心跳信息、数据块汇报信息(`BlockReport`)、缓存数据块汇报信息(`CacheReport`)以及增量数据块块汇报信息。`Namenode`会根据块汇报的内容，修改`Namenode`的命名空间(`Namespace`),同时向`Datanode`返回名字节点指令。`Datanode`会响应`Namenode`返回的名字节点指令，如创建、删除和复制数据块指令等。
 
 
 
+### 4.1 Datanode逻辑结构
+
+#### 4.1.1 HDFS 1.X架构
+
+`HDFS1.x`架构从逻辑上可以分为两层：
+
+1. 命名空间管理层：管理整个文件系统的命名空间(`Namespace`),包括文件系统目录树中的文件信息、目录信息以及文件包含的数据块信息等。对外提供常见的文件系统操作，例如创建文件、修改文件以及删除文件等。
+2. 数据块存储管理层：该层分为两个部分。
+   1. 数据块管理：管理数据节点(`Datanode`)信息以及数据块信息，对外提供操作数据块的接口，例如创建、删除、修改、获取数据块位置信息等。
+   2. 存储(`Storage`)管理：管理`Datanode`上保存数据块的物理存储以及数据块文件，对外提供写数据块文件、读数据块文件以及复制数据块文件等功能。
+
+<img src="images/image_20220429_102804.jpg" alt="image_20220429_102804" style="zoom:80%;" />
+
+`Namenode`实现了==命名空间管理层==及==数据块存储管理层中的数据块管理==功能，而`Datanode`则实现了==数据块存储管理层中的存储管理==部分。如图所示，`Datanode`会在`Namenode`上注册，并定期向`Namenode`发送数据块汇报与心跳，`Namenode`则会通过心跳响应发送数据块操作指令给`Datanode`,例如复制、删除以及恢复数据块等指令。可以说`Namenode`的数据块管理层和`Datanode`共同完成了`HDFS`的数据块存储管理功能。
+
+`HDFS 1.X`架构使用一个`Namenode`来管理文件系统的命名空间以及数据块信息，这使得`HDFS`的实现非常简单，但是单一的`Namenode`会导致以下缺点:
+
+1. 由于`Namenode`在内存中保存整个文件系统的元数据，所以`Namenode`内存的大小直接限制了文件系统的大小。
+2. 由于`HDFS`文件的读写等流程都涉及与`Namenode`交互，所以文件系统的吞吐量受限于单个`Namenode`的处理能力。
+3. `Namenode`作为文件系统的中心节点，无法做到数据的有效隔离。
+4. `Namenode`是集群中的单一故障点，有可用性隐患。
+5. `Namenode`实现了数据块管理以及命名空间管理功能，造成这两个功能高度耦合，难以让其他服务单独使用数据块存储功能。
+
+#### 4.1.2 HDFS Federation
+
+为了能够水平扩展`Namenode`,`HDFS2.X`提供了`Federation`架构，如图所示，`Federation`架构的`HDFS`集群可以定义多个`Namenode/Namespace`,这些`Namenode`之间是相互独立的，它们各自分工管理着自己的命名空间。而`HDFS`集群中的`Datanode`则提供数据块的共享存储功能，每个`Datanode`都会向集群中所有的`Namenode`注册，且周期性地向所有的`Namenode`发送心跳和块汇报，然后执行`Namenode`通过响应发回的名字节点指令。
+
+<img src="images/image_20220429_103902.jpg" alt="image_20220429_103902" style="zoom:80%;" />
+
+`HDFS Federation`引入了两个新的概念：块池(`BlockPool`)和命名空间卷(`Namespace Volume`)。
+
+1. 块池：一个块池由属于同一个命名空间的所有数据块组成，这个块池中的数据块可以存储在集群中的所有`Datanode`上，而每个`Datanode`都可以存储集群中所有块池的数据块。这里需要注意的是，每个块池都是独立管理的，不会与其他块池交互。所以一个`Namenode`出现故障时，并不会影响集群中的`Datanode`服务于其他的
+2. `Namenode`命名空间卷：一个`Namenode`管理的==命名空间以及它对应的块池一起被称为命名空间卷==，当一个`Namenode/Namespace`被删除后，它对应的块池也会从集群的`Datanode`上删除。需要特别注意的是，当集群升级时，每个命名空间卷都会作为一个基本的单元进行升级。
+
+`HDFS Federation`架构相对于`HDFS 1.X`架构具有如下优点:
+
+1. 支持`Namenode/Namespace`的水平扩展性，同时为应用程序和用户提供了命名空间卷级别的隔离性。
+2. `Federation`架构实现起来比较简单，`Namenode`(包括`Namespace`)的实现并不需要太大的改变，只需更改`Datanode`的部分代码即可。例如将`BlockPool`作为数据块存储的一个新层次，以及更改`Datanode`内部的数据结构等。
+
+在`BlockStorage`层中，每个块池都是一个独立的数据块集合，块池在管理上与其他块池独立，相互之间不需要协调。`Datanode`则提供==共享存储功能==，==存储所有块池的数据块==。`Datanode`会定期向`BlockStorage`层注册并发送心跳，同时会为每个块池发送块汇报。`Block Storage`层会向`Datanode`发送数据块管理命令，之后`Datanode`会执行这些管理命令，例如数据块的复制、删除等。`Block Storage`层会对上层应用提供管理数据块的接口，例如在指定块池添加数据块、删除数据块等。
+
+分离出Block storage层会带来以下优势:
+
+1. 解耦合`Namespace`管理以及`Block Storage`管理。
+2. 其他应用可以绕过`Namenode/Namesapce`直接管理数据块，例如`HBase`等应用可以直接使用`Block Storage`层。
+3. 可以在`Block Storage`上构建新的文件系统(non-HDFS)。
+4. 使用分离的`Block Storage`层为分布式命名空间的实现提供了基础。
+
+#### 4.1.3 Datanode逻辑架构
+
+![image_20220429_110645](images/image_20220429_110645.jpg)
+
+### 4.2 Datanode存储
+
+#### 4.2.3 DataStorage实现
+
+存储状态恢复操作
+
+`Datanode`在执行升级、回滚、提交操作的过程中会出现各种异常，例如误操作、断电、宕机等情况。那么`Datanode`在重启时该如何恢复上一次中断的操作呢？`StorageDirectory`提供了`doRecover()`和`analyzeStorage()`两个方法，`Datanode`会首先调用`analyzeStorage()`方法分析当前节点的存储状态，然后根据分析所得的存储状态调用`doRecover()`方法执行恢复操作。图给出了存储状态恢复操作流程图。
+
+![image-20220429142601708](images/image-20220429142601708.png)
+
+`analyseStorage()`方法用于在`Datanode`启动时分析当前`Datanode`存储目录的状态，`Datanode`存储目录的状态定义在`Storage.StorageState`类中。对存储目录状态的分析还需要结合`Datanode`的升级机制以及`Datanode`的启动选项，存储目录状态判断的逻辑如下。
+
+1. `NON EXISTENT`:以非`FORMAT`选项启动时，目录不存在；或者目录不可写、路径为文件时，存储目录状态都为`NOT EXISTENT`状态。
+2. `NOT FORMATTED`:以`FORMAT`选项启动时，都为`NOT FORMATTED`状态。
+3. `NORMAL`:没有`tmp`中间状态文件夹，则存储目录为正常状态。
+4. `COMPLETE_UPGRADE`:存在`current/VERSION`文件，存在`previous.tmp`文件夹，则存储目录为升级完成状态。
+5. `RECOVER_UPGRADE`:存在`previous.tmp`文件夹，不存在`current/VERSION`文件，存储目录应该从升级中恢复。
+6. `COMPLETE ROLLBACK`:存在`removed.tmp`文件夹，也存在`current/VERSION`文件，则存储目录的回滚操作成功完成。
+7. `RECOVER ROLLBACK`:存在`removed.tmp`文件夹，不存在`current/VERSION`文件，存储目录应该从回滚中恢复。
+8. `COMPLETE FINALIZE`:存在`finalized.tmp`文件夹，存储目录可以继续执行提交操作。
+
+### 4.3 文件系统数据集
+
+`BlockPoolSlice`负责管理单个存储目录下单个池块的所有数据块；`FsVolumeImpl`则负责管理一个完整的存储目录下所有的数据块，也就包括了这个存储目录下多个`BlockPoolSlice`对象的引用。而`Datanode`可以定义多个存储目录，也就是定义多个`FsVolumeImpl`对象，在`HDFS`中使用`FsVolumeList`对象统一管理`Datanode`上定义的多个`FsVolumeImpl`对象。而`FsDatasetImpl`负责管理`Datanode`上所有数据块功能的类。
 
 
 
+### 4.4 BlockPoolManager
+
+在`HDFS Federation`部署中，一个`HDFS`集群可以配置多个命名空间(`Namespace`),每个`Datanode`都会存储多个块池的数据块。所以在`Datanode`实现中，定义了`BlockPoolManager`类来管理`Datanode`上的所有块池，`Datanode`的其他模块对块池的操作都必须通过`BlockPoolManager`执行，每个`Datanode`都有一个`BlockPoolManager`的实例。
+
+`BlockPoolManager`逻辑结构图如图所示。由于在`HDFS Federation`部署中，一个`Datanode`会保存多个块池的数据块，所以`BlockPoolManager`会拥有多个`BPOfferService`对象，每个`BPOfferService`对象都封装了对单个块池操作的`API`。同时，由于在`HDFS HA`部署中，每个命名空间又会同时拥有两个`Namenode`,一个作为活动的`Active Namenode`,另一个作为热备的`Standby Namenode`,所以每个`BPOfferService`都会包含两个`BPServiceActor`对象，每个`BPServiceActor`对象都封装了与该命名空间中单个`Namenode`的操作，包括定时向这个`Namenode`发送心跳(`heartbeat`)、增量块汇报(`blockReceivedAndDeleted`)、全量块汇报(`blockreport`)、缓存块汇报(`cacheReport`),以及执行`Namenode`通过心跳/块汇报响应传回的名字节点指令等操作。
+
+![image-20220501152459161](images/image-20220501152459161.png)
 
 
 
+#### 4.4.1 BPServerActor
 
+##### offerService()
 
+`offerService()`方法是`BPServiceActor`的主循环方法，它用于向`Namenode`发送心跳、块汇报、缓存汇报以及增量汇报。`offerService()`方法会一直循环运行，直到`Datanode`关闭或者客户端调用`ClientDatanodeProtocol.refreshNodes()`重新加载`Namenode`配置。
 
+`offerService()`是通过调用`DatanodeProtocol.sendHeartbeat()`方法向`Namenode`发送心跳的。`Datanode`向`Namenode`发送的心跳信息主要包括，这些数据描述了Datanode当前的负载情况。：
 
+1. `Datanode`注册信息
+2. `Datanode`存储信息（使用容量，剩余容量等)
+3. 缓存信息
+4. 当前`Datanode`写文件的连接数
+5. 以及读写数据使用的线程数等。
 
+```java
+public HeartbeatResponse sendHeartbeat(DatanodeRegistration registration,
+    StorageReport[] reports, long cacheCapacity, long cacheUsed,
+    int xmitsInProgress, int xceiverCount, int failedVolumes,
+    VolumeFailureSummary volumeFailureSummary,
+    boolean requestFullBlockReportLease,
+    @Nonnull SlowPeerReports slowPeers,
+    @Nonnull SlowDiskReports slowDisks) throws IOException
+```
 
+`Namenode`收到`Datanode`的心跳之后，会返回一个心跳响应`HeartbeatResponse`。这个心跳响应中包含一个`DatanodeCommand`的数组，用来携带`Namenode`对`Datanode`的名字节点指令。同时心跳响应中还包含一个`NNHAStatusHeartbeat`对象，用来标识当前`Namenode`的`HA`状态。`Datanode`会使用这个字段来确定`BPOfferService`当中的哪一个`BPServiceActor`对应的`Namenode`是`Active`状态的。`HeartbeatResponse`的定义如下代码所示。
 
+```java
+public class HeartbeatResponse {
+  /** Commands returned from the namenode to the datanode */
+  private final DatanodeCommand[] commands;
+  
+  /** Information about the current HA-related state of the NN */
+  private final NNHAStatusHeartbeat haStatus;
+
+  private final RollingUpgradeStatus rollingUpdateStatus;
+```
 
 
 
