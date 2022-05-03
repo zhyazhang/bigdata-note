@@ -519,17 +519,255 @@ public class HeartbeatResponse {
   private final RollingUpgradeStatus rollingUpdateStatus;
 ```
 
+### 4.5 流式接口
+
+#### 4.5.5读数据
+
+##### 2数据块的传输格式
+
+`BlockSender`类主要负责从数据节点的磁盘读取数据块，然后发送数据块到接收方。需要注意的是，`BlockSender`发送的数据是以一定结构组织的：
+
+![image-20220502161918730](images/image-20220502161918730.png)
+
+```java
+int dataLen = (int) Math.min(endOffset - offset,(chunkSize * (long) maxChunks));
+int numChunks = numberOfChunks(dataLen); // Number of chunks be sent in the packet
+int checksumDataLen = numChunks * checksumSize;
+int packetLen = dataLen + checksumDataLen + 4;
+```
+
+##### 4 零拷贝数据传输
+
+`Datanode`最重要的功能之一就是读取数据块，这个操作看似简单，但在操作系统层面却需要4个步骤才能完成。如图所示，`Datanode`会首先将数据块从磁盘存储（也可能是`SSD`、内存等异构存储)读入操作系统的内核缓冲区（步骤1），再将数据跨内核推到`Datanode`进程(步骤2)，然后`Datanode`会再次跨内核将数据推回内核中的套接字缓冲区（步骤3），最后将数据写入网卡缓冲区（步骤4)。可以看到，`Datanode`对数据进行了两次多余的数据拷贝操作(步骤2和步骤3)，`Datanode`只是起到缓存数据并将其传回套接字的作用而以，别无他用。这里需要注意的是，步骤1和步骤4的拷贝发生在外设（例如磁盘和网卡)和内存之间，由`DMA(Direct Memory Access`,直接内存存取)引擎执行，而步骤2和步骤3的拷贝则发生在内存中，由`CPU`执行。
+
+> 操作系统之所以引入内核缓冲区，是为了提高读写性能。在读操作中，如果应用程序所需的数据量小于内核缓冲区大小时，内核缓冲区可以预读取部分数据，从而提高应用程序的读效率。在写操作中，引入中间缓冲区则可以让写入过程异步完成。而对于`Datanode`,由于读取的数据块文件往往比较大，引入中间缓冲区可能成为一个性能瓶颈，造成数据在磁盘、内核缓冲区和用户缓冲区中被拷贝多次。
+
+![image-20220503100225839](images/image-20220503100225839.png)
+
+上述读取方式除了会造成多次数据拷贝操作外，还会增加内核态与用户态之间的上下文切换。如图所示，`Datanode`通过`read()`系统调用将数据块从磁盘（或者其他异构存储）读取到内核缓冲区时，会造成第一次用户态到内核态的上下文切换（切换1）。之后在系统调用`read()`返回时，会触发内核态到用户态的上下文切换（切换2）。`Datanode`成功读入数据后，会调用系统调用`send()`发送数据到套接字，也就是在数据块第三次拷贝时，会再次触发用户态到内核态的上下文切换（切换3）。当系统调用`send()`返回时，内核态又会重新切换回用户态。所以这个简单的读取操作，==会造成4次用户态与内核态之间的上下文切换。==
+
+![image-20220503100517486](images/image-20220503100517486.png)
+
+`Java NIO`提供了零拷贝模式来消除这些多余的拷贝操作，并且减少内核态与用户态之间的上下文切换。使用零拷贝的应用程序可以要求内核直接将数据从磁盘文件拷贝到网卡缓冲区，而无须通过应用程序周转，从而大大提高了应用程序的性能。`Java`类库定义了`java.nio.channels..FileChannel..transferTo()`方法，用于在`Linux(UNTX)`系统上支持零拷贝，它的声明如下：
+
+```java
+ public abstract long transferTo(long position, long count,
+                                    WritableByteChannel target)throws IOException;
+```
+
+`transferTo()`方法读取文件通道(`FileChannel`)中`position`参数指定位置处开始的`count`个字节的数据，然后将这些数据直接写入目标通道`target`中。`HDFS`的`SocketOutputStream`对象的`transferToFully()`方法封装了`FileChannel.transferTo()`方法，对`Datanode`提供支持零拷贝的数据读取功能。`transferToFully()`方法的定义如下：
+
+```java
+  public void transferToFully(FileChannel fileCh, long position, int count,
+      LongWritable waitForWritableTime,
+      LongWritable transferToTime) throws IOException {}
+```
+
+图给出了使用零拷贝读取数据块时缓冲区拷贝流程，`Datanode`调用`transferTo()`方法引发`DMA`引擎将文件内容拷贝到内核缓冲区（步骤1）。之后数据并未被拷贝到`Datanode`进程中，而是由`DMA`引擎直接把数据从内核缓冲区传输到网卡缓冲区（步骤2)。可以看到，使用零拷贝模式的数据块读取，==数据拷贝的次数从4次降低到了2次==。
+
+> 零拷贝模式要求底层网络接口卡支持收集操作，在Linux内核2.4及后期版本中，套接字缓冲区描述符做了相应调整，可以满足该需求。
+
+使用零拷贝模式除了降低数据拷贝的次数外，上下文切换次数也从4次降低到了2次。如图所示，当`Datanode`调用`transferTo()`方法时会发生用户态到内核态的切换，`transferTo()`方法执行完毕返回时内核态又会切换回用户态。
+
+![image_20220503_101409](images/image_20220503_101409.jpg)
+
+`BlockSender`使用`SoucketoutputStream.transferToFully()`封装的零拷贝模式发送数据块到客户端，由于数据不再经过`Datnaode`中转，而是直接在内核中完成了数据的读取与发送，所以大大地提高了读取效率。但这也带来了一个问题，由于数据不经过`Datanode`的内存，所以`Datanode`失去了在客户端读取数据块过程中对数据校验的能力。为了解决这个问题，HDFS将数据块读取操作中的数据校验工作放在客户端执行，客户端完成校验工作后，会将校验结果发送回`Datanode`。在`DataXceiver.readBlock()`的清理动作中，数据节点会接收客户端的响应码，以获取客户端的校验结果。
+
+#### 4.5.6 写数据
+
+如图所示，`HDFS`使用数据流管道方式来写数据。`DFSClient`通过调用`Sender.writeBlock()`方法触发一个==写数据块请求==，这个请求会传送到数据流管道中的每一个数据节点，数据流管道中的==最后一个数据节点会回复请求确认==，这个确认消息逆向地通过数据流管道送回`DFSClient`。`DFSClient`收到请求确认后，将要写入的数据块切分成若干个数据包(`packet`),然后依次向数据流管道中发送这些数据包。数据包会首先从`DFSClient`发送到数据流管道中的第一个数据节点（这里是`Datanode1`),`Datanode1`成功接收数据包后，会将数据包==写入磁盘==，然后将数据包发送到数据流管道中的第二个节点(`Datanode2`)。依此类推，当数据包到达数据流管道中的最后一个节点(`Datanode3`)时，`Datanode3`会对收到的==数据包进行校验==，如果校验成功，`Datanode3`会发送数据包确认消息，这个确认消息会逆向地通过数据流管道送回`DFSClient`。当一个数据块中的所有数据包都成功发送完毕，并且收到确认消息后，`DFSClient`会发送一个空数据包标识当前数据块发送完毕。至此，整个数据块发送流程结束。
+
+![image-20220503103534120](images/image-20220503103534120.png)
+
+##### 1 DataXceiver.writeBlock()
+
+<img src="images/image-20220503104150113.png" alt="image-20220503104150113" style="zoom:80%;" />
 
 
 
+```java
+//isDatanode变量指示当前写操作是否是DESClient发起的
+final boolean isDatanode = clientname.length() == 0;
+//isclient变量与isDatanode相反，表示是Datanode触发的写操作
+final boolean isClient = !isDatanode;
+//isTransfer变量指示当前的写操作是否为数据块复制操作，利用数据流管道状态来判断
+final boolean isTransfer = stage == BlockConstructionStage.TRANSFER_RBW
+    || stage == BlockConstructionStage.TRANSFER_FINALIZED;
+```
+
+对于客户端发起的写数据块请求，这里三个变量的值分别为`isDatanode一false`,`isClient一true`,`isTransfer一false`。在`writeBlock()`方法中还使用到两组输入/输出流。
+
+![image-20220503104944895](images/image-20220503104944895.png)
+
+`Datanode`与数据流管道中的上游节点通信用到了输入流`in`以及输出流`replyOut`,与数据流管道中的下游节点通信则用到了输入流`mirrorIn`以及输出流`mirrorOut`。`writeBlock()`方法的第二部分就是初始化这两组输入输出流，并向下游节点发送数据包写入请求，然后等待下游节点的请求确认。如果下游节点确认了请求，则向上游节点返回这个确认请求；如果抛出了异常，则向上游节点发送异常响应。
+
+##### 2 BlockReceiver
+
+`BlockReceiver`类负责从数据流管道中的上游节点接收数据块，然后保存数据块到当前数据节点的存储中，再将数据块转发到数据流管道中的下游节点。同时`BlockReceiver`还会接收来自下游节点的响应，并把这个响应发送给数据流管道中的上游节点`BlockReceiver`接收数据块的流程如图所示。
+
+```java
+if (isClient && !isTransfer) {
+  responder = new Daemon(datanode.threadGroup, 
+      new PacketResponder(replyOut, mirrIn, downstreams));
+  responder.start(); // start thread to processes responses
+}
+
+while (receivePacket() >= 0) { /* Receive until the last packet */ }
+
+// wait for all outstanding packet responses. And then
+// indicate responder to gracefully shutdown.
+// Mark that responder has been closed for future processing
+if (responder != null) {
+  ((PacketResponder)responder.getRunnable()).close();
+  responderClosed = true;
+}
+```
 
 
 
+![image-20220503110217666](images/image-20220503110217666.png)
 
 
 
+##### 3 receivePacket()
+
+![image-20220503111033056](images/image-20220503111033056.png)
 
 
 
+### 4.8 DataNode类的实现
+
+#### 4.8.1 DataNode的启动
+
+`DataNode`的构造函数在初始化了若干配置文件中定义的参数后，调用`startDataNode()`方法完成`DataNode`的初始化操作，`startDataNode()`方法初始化了`DataStorage`对象、`DataXceiverServer`对象、`shortCircuitRegistry`对象，启动了`HttpInfoServer`,初始化了`DataNode`的`IPC Server`,然后创建`BlockPoolManager`并加载每个块池定义的`Namenode`列表。`startDataNode()`方法的代码如下：
+
+```java
+void startDataNode(List<StorageLocation> dataDirectories,
+                   SecureResources resources
+                   ) throws IOException {
+
+  // settings global for all BPs in the Data Node
+    //设置Datanode的存储目录
+  this.secureResources = resources;
+  synchronized (this) {
+    this.dataDirs = dataDirectories;
+  }
+    //加载Datanode配置
+  this.dnConf = new DNConf(this);
+  checkSecureConfig(dnConf, getConf(), resources);
+    
+
+    //构造DataStorage对象
+  storage = new DataStorage();
+  
+  // global DN settings
+  registerMXBean();
+    
+    //创建DataXceiverServer对象
+  initDataXceiver();
+    //启动HttpInfoServer服务
+  startInfoServer();
+  pauseMonitor = new JvmPauseMonitor();
+ 
+  pauseMonitor.init(getConf());
+  pauseMonitor.start();
+    
+    //初始化DataNode IPC Server
+  initIpcServer();
+
+  //创建BlockPoolManager并加载每个块池定义的Namenode列表  
+  blockPoolManager = new BlockPoolManager(this);
+  blockPoolManager.refreshNamenodes(getConf());
+
+  // Create the ReadaheadPool from the DataNode context so we can
+  // exit without having to explicitly shutdown its thread pool.
+    
+    //创建ReadaheadPool对象
+  readaheadPool = ReadaheadPool.getInstance();
+}
+```
+
+成功初始化`DataNode`对象之后，就需要调用`runDatanodeDaemon()`方法启动`DataNode`的服务了。`runDatanodeDaemon()`方法启动了`blockPoolManager`管理的所有线程，启动了`DataXceiverServer`线程，最后启动了`DataNode`的`IPC Server`。需要特别注意的是，`DataBlockScanner`线程以及`DirectoryScanner`线程并不是在`runDatanodeDaemon()`方法中启动的，而是在`initBlockPool()`方法中调用`initPeriodicScanners()`方法启动的。
+
+```java
+public void runDatanodeDaemon() throws IOException {
+  blockPoolManager.startAll();
+
+  // start dataXceiveServer
+  dataXceiverServer.start();
+  if (localDataXceiverServer != null) {
+    localDataXceiverServer.start();
+  }
+  ipcServer.setTracer(tracer);
+  ipcServer.start();
+  startPlugins(getConf());
+}
+```
+
+#### 4.8.2 Datanode的停止
+
+`shutdown()`方法用于关闭`DataNode`实例的运行，这个方法首先将`DataNode.shouldRun`字段设置为`false`,这样所有的`BPServiceActor`线程、`DataXceiverServer`线程、`PacketResponder`以及`DataBlockScanner`线程的循环条件就会不成立，线程也就自动退出运行了。如果这个关闭操作是用于重启，且当前`Datanode`正处于写数据流管道中，则向上游数据节点发送`OOB`消息通知客户端，之后调用`DataXceiverServer.kill()`方法强行关闭流式接口底层的套接字连接。接下来`shutdown()`方法会关闭`DataBlockScanner`以及`DirectoryScanner`,关闭`WebServer`,然后在`DataXceiverServer`对象上调用`join()`方法，等待`DataXceiverServer`线程成功退出。最后依次关闭`DataNode`的`IPC Server`、`BlockPoolManager`对象、`DataStorage`对象以及`FSDatasetImpl`对象。
+
+`shutdown()`方法结束运行后，数据节点上的所有服务线程也都退出了，`secureMain()`方法的`join()`调用返回，然后`secureMain()`方法会执行它的`finally`语句，并在日志系统中打印“`ExitingDatanode`”信息后，结束数据节点的运行并退出。
 
 
+
+## 第五章 HDFS客户端
+
+`HDFS`目前提供了三个客户端接口：`DistributedFileSystem`、`FsShell`和`DFSAdmin`。`DistributedFileSystem`为用户开发基于`HDFS`的应用程序提供了`API`;`FsShell`工具使用户可以通过`HDFS Shell`命令执行常见的文件系统操作，例如创建文件、删除文件、创建目录等；`DFSAdmin`则向系统管理员提供了管理`HDFS`的工具，例如执行升级、管理安全模式等操作。
+
+`DistributedFileSystem`、`FsShell`以及`DFSAdmin`都是通过直接或者间接地持有`DFSClient`对象的引用，然后调用`DFSClient`提供的接口方法对`HDFS`进行管理和操作的。`DFSClient`类封装了HDFS复杂的交互逻辑，对外提供了简单的接口，所以本章以`DFSClient`类作为入口来研究和学习HDFS客户端的逻辑以及源码实现。
+
+### 5.1 DFSCLient实现
+
+`DFSClient`是一个真正实现了分布式文件系统客户端功能的类，是用户使用`HDFS`各项功能的起点。`DFSClient`会连接到`HDFS`,对外提供管理文件/目录、读写文件以及管理与配置`HDFS`系统等功能。
+
+对于管理文件/目录以及管理与配置`HDFS`系统这两个功能，`DFSClient`并不需要与`Datanode`交互，而是直接通过远程接口`ClientProtocol`调用`Namenode`提供的服务即可。而对于文件读写功能，`DFSClient`除了需要调用`ClientProtocol`与`Namenode`交互外，还需要通过流式接口`DataTransferProtocol`与`Datanode`交互传输数据。
+
+`DFSClient`对外提供的接口方法可以分为如下几类:
+
+1. `DFSClient`的构造方法和关闭方法。
+2. 管理与配置文件系统相关方法。
+3. 操作`HDFS`文件与目录方法。
+4. 读写`HDFS`文件方法。
+
+##### 5.1.3 文件系统管理与配置方法
+
+<img src="images/image_20220503_153553.jpg" alt="image_20220503_153553" style="zoom:80%;" />
+
+`DFSClient`中许多命令是直接建立与`Datanode`或者`Namenode`的`RPC`连接，然后调用对应的`RPC`方法实现。
+
+##### 5.1.4 HDFS文件与目录操作方法
+
+除了管理与配置HDFS文件系统外，`DFSClient`的另一个重要功能就是操作`HDFS`文件与目录，例如`setPermission()`、`rename()`、`getFileInfo()`、`delete()`等对文件/目录树的增、删、改、查等操作。它们都是首先调用`checkOpen()`检查`DFSClient`的运行情况，然后调用`ClientProtocol`对应的`RPC`方法，触发`Namenode`更改文件系统目录树。
+
+```java
+public void rename(String src, String dst, Options.Rename... options)
+    throws IOException {
+  checkOpen();
+  try (TraceScope ignored = newSrcDstTraceScope("rename2", src, dst)) {
+    namenode.rename2(src, dst, options);
+  } catch (RemoteException re) {
+    throw re.unwrapRemoteException(AccessControlException.class,
+        DSQuotaExceededException.class,
+        QuotaByStorageTypeExceededException.class,
+        FileAlreadyExistsException.class,
+        FileNotFoundException.class,
+        ParentNotDirectoryException.class,
+        SafeModeException.class,
+        NSQuotaExceededException.class,
+        UnresolvedPathException.class,
+        SnapshotAccessControlException.class);
+  }
+}
+```
+
+### 5.2 文件读操作与输入流
+
+#### 5.2.2 读操作——DFSInputStream实现
+
+HDFS目前实现的读操作有三个层次，分别是==网络读==、==短路读(short circuit read)==以及==零拷贝读(zero copy read)==,它们的读取效率依次递增。
+
+1. 网络读：网络读是最基本的一种`HDFS`读，`DFSClient`和`Datanode`通过建立`Socket`连接传输数据。
+2. 短路读：当`DFSClient`和保存目标数据块的`Datanode`在同一个物理节点上时，`DFSClient`可以直接打开数据块副本文件读取数据，而不需要`Datanode`进程的转发。
+3. 零拷贝读：当`DFSClient`和缓存目标数据块的`Datanode`在同一个物理节点上时，`DFSClient`可以通过零拷贝的方式读取该数据块，大大提高了效率。而且即使在读取过程中该数据块被`Datanode`从缓存中移出了，读取操作也可以退化成本地短路读，非常方便。
