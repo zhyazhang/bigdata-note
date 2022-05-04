@@ -771,3 +771,103 @@ HDFS目前实现的读操作有三个层次，分别是==网络读==、==短路�
 1. 网络读：网络读是最基本的一种`HDFS`读，`DFSClient`和`Datanode`通过建立`Socket`连接传输数据。
 2. 短路读：当`DFSClient`和保存目标数据块的`Datanode`在同一个物理节点上时，`DFSClient`可以直接打开数据块副本文件读取数据，而不需要`Datanode`进程的转发。
 3. 零拷贝读：当`DFSClient`和缓存目标数据块的`Datanode`在同一个物理节点上时，`DFSClient`可以通过零拷贝的方式读取该数据块，大大提高了效率。而且即使在读取过程中该数据块被`Datanode`从缓存中移出了，读取操作也可以退化成本地短路读，非常方便。
+
+#### block、chunk、packet
+
+1. `block`是最大的一个单位，一个`HDFS`文件数据块，它是最终存储于`DataNode`上的数据粒度，由`dfs.blocksize`参数决定，默认是128M；
+2. `packet`是中等的一个单位，用来传输一组校验块的集合，一个数据包会包含一个头域，然后是所有校验块的校验和，接下来是校验块的序列。它是数据由`DFSClient`流向`DataNode`的粒度，以`dfs.client-write-packet-size`参数为参考值，默认是`64K`；注：这个参数为参考值，是指真正在进行数据传输时，会以它为基准进行调整，调整的原因是一个`packet`有特定的结构，调整的目标是这个`packet`的大小刚好包含结构中的所有成员，同时也保证写到`DataNode`后当前`block`的大小不超过设定值；
+3. `chunk`是最小的一个单位，数据块会被切分成若干校验块，每个校验块的大小为一个校验和所验证的数据块大小，它是`DFSClient`到`DataNode`数据传输中进行数据校验的粒度，由`io.bytes.per.checksum`参数决定，默认是`512B`；注：事实上一个`chunk`还包含`4B`的校验值，因而`chunk`写入`packet`时是`516B`；数据与检验值的比值为`128:1`，所以对于一个`128M`的`block`会有一个`1M`的校验文件与之对应；
+
+```
+// Each packet looks like:
+//   PLEN    HLEN      HEADER     CHECKSUMS  DATA
+//   32-bit  16-bit   <protobuf>  <variable length>
+//
+// PLEN:      Payload length
+//            = length(PLEN) + length(CHECKSUMS) + length(DATA)
+//            This length includes its own encoded length in
+//            the sum for historical reasons.
+//
+// HLEN:      Header length
+//            = length(HEADER)
+//
+// HEADER:    the actual packet header fields, encoded in protobuf
+// CHECKSUMS: the crcs for the data chunk. May be missing if
+//            checksums were not requested
+// DATA       the actual block data
+```
+
+
+
+### 5.3 文件短路读
+
+`Hadoop`的一个重要思想就是移动计算，而不是移动数据。这种设计方式使得客户端常常与数据块所在的`Datanode`在同一台机器上，那么当`DFSClient`读取一个本地数据块时，就会出现本地读取(`LocalRead`)操作。在`HDFS`早期版本中，本地读取和远程读取的实现是一样的，如图所示，客户端通过`TCP`套接字连接`Datanode`,并通过`DataTransferProtocol`传输数据。这种方式很简单，但是有一些不好的地方，例如`Datanode`需要为每个读取数据块的客户端都维持一个线程和`TCP`套接字。内核中`TCP`协议是有开销的，`DataTransferProtocol`本身也有开销，因此这种实现方式有值得优化的地方。
+
+![image-20220504100331830](images/image-20220504100331830.png)
+
+短路读取就是这种思想的实现，目前`HDFS`提供了两种短路读取方案:
+
+##### 1. FS-2246
+
+`Datanode`将所有的数据路径权限开放给客户端，当执行一个本地读取时，客户端直接从本地磁盘的数据路径读取数据。但这种实现方式带来了安全问题，客户端用户可以直接浏览所有数据，可见这并不是一个很好的选择。`HDFS-2246`实现的短路读取模式如图所示:
+
+![image-20220504100517488](images/image-20220504100517488.png)
+
+##### 2.HDFS-347
+
+`UNIX`提供了一种`UNIX Domain Socket`进程间通信方式，它使得同一台机器上的两个进程能以`Socket`的方式通信，并且还可以在进程间传递文件描述符。
+
+`HDFS-347`使用该机制实现了安全的本地短路读取，如图所示。客户端向`Datanode`请求数据时，`Datanode`会打开块文件和校验和文件，将这两个文件的文件描述符直接传给客户端，而不是将路径传给客户端。客户端接收到这两个文件的文件描述符之后，就可以直接打开文件读取数据了，也就绕过了`Datanode`进程的转发，提高了读取效率。因为文件描述符是只读的，所以客户端不能修改该文件。同时，由于客户端自身无法访问数据块文件所在的目录，所以它也就不能访问其他不该访问的数据了，保证了读取的安全性。`HDFS2.X`采取的就是`HDFS-347`的设计实现短路读取功能的。
+
+![image-20220504100710288](images/image-20220504100710288.png)
+
+#### 5.3.1短路读共享内存
+
+如图所示，当`DFSClient`和`Datanode`在同一台机器上时，需要一个共享内存段来维护所有短路读取副本的状态，共享内存段中会有很多个槽位，每个槽位都记录了一个短路读取副本的信息，例如当前副本是否有效、`锚(anchor)`的次数等。
+
+这里我们解释一下==锚==的概念。当`Datanode`将一个数据块副本缓存到内存中时，会将这个数据块副本设置为可锚(`anchorable`)状态，也就是在共享内存中该副本对应的槽位上设置可锚状态位。当一个副本被设置为可锚状态之后，`DFSClient`的`BlockReaderLocal`对象读取该副本时就不再需要校验操作了（因为缓存中的副本已经执行过校验操作)，并且输入流可以通过零拷贝模式读取这个副本。每当客户端进行这两种读取操作时，都需要在副本对应的槽位上添加一个锚计数，只有副本的锚计数为零时，`Datanode`才可以从缓存中删除这个副本。可以
+看到，共享内存以及槽位机制很好地在`Datanode`进程和`DFSClient`进程间同步了副本的状态，保证了`Datanode`缓存操作以及`DFSClient`读取副本操作的正确性。
+
+![image-20220504102511087](images/image-20220504102511087.png)
+
+如图所示，共享内存机制是由`DFSClient`和`Datanode`对同一个文件执行内存映射操作实现的，因为`MappedByteBuffer`对象能让内存与物理文件的数据实时同步，所以`DFSClient`和`Datanode`进程会通过中间文件来交换数据，中间文件使得两个进程的内存区域得到及时的同步。`DFSClient`和`Datanode`之间可能会有多段共享内存，所以`DFSClient`定义了`DFSClientShm`类抽象`DFSClient`侧的一段共享内存，定义了`DFSClientShmManager`类管理所有的`DFSClientShm`对象；而`Datanode`则定义了`RegisteredShm`类抽象`Datanode`侧的一段共享内存，同时定义了`ShortCircuitRegistry`类管理所有`Datanode`侧的共享内存。
+
+![image-20220504102824774](images/image-20220504102824774.png)
+
+`DFSClient`会调用`DataTransferProtocol.requestShortCircuitShm`接口与`Datanode`协商创建一段共享内存，共享内存创建成功后，`DFSClient`和`Datanode`会分别构造`DFSClientShm`以及`RegisteredShm`对象维护这段共享内存。如图所示，共享内存中的文件映射数据是实时同步的，它保存了所有槽位的二进制信息。但是映射数据中二进制的槽位信息并不便于操作，所以`DFSClientShm`和`RegisteredShm`会构造一个`Slot`对象操作映射数据中的一个槽位，同时各自定义了集合字段保存所有的`Slot`对象。这里需要特别注意的是，`Slot`对象会由`DFSClientShm`和`RegisteredShm`分别构造并保存在各自的集合字段中，所以`DFSClientShm`和`RegisteredShm`之间需要同步Slot对象的创建和删除操作，以保证`DFSClientShm`和
+`RegisteredShm`保存的Slot对象信息是完全同步的。`DataTransferProtocol`接口就提供了`requestShortCircuitFds()`以及`releaseShortCircuitFds()`方法同步Slot对象的创建和删除操作。
+
+![image-20220504103726237](images/image-20220504103726237.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
