@@ -839,11 +839,54 @@ HDFS目前实现的读操作有三个层次，分别是==网络读==、==短路�
 
 ![image-20220504103726237](images/image-20220504103726237.png)
 
+### 5.4 文件写操作与输出流
+
+#### 5.4.1 创建文件
+
+`computePacketChunkSize()`方法计算发送数据包大小，以及数据包中包含了多少个校验块：
+
+```java
+protected void computePacketChunkSize(int psize, int csize) {
+  final int bodySize = psize - PacketHeader.PKT_MAX_HEADER_LEN;
+  final int chunkSize = csize + getChecksumSize();
+  chunksPerPacket = Math.max(bodySize/chunkSize, 1);
+  packetSize = chunkSize*chunksPerPacket;
+  DFSClient.LOG.debug("computePacketChunkSize: src={}, chunkSize={}, "
+          + "chunksPerPacket={}, packetSize={}",
+      src, chunkSize, chunksPerPacket, packetSize);
+}
+```
+
+![image-20220504150040098](images/image-20220504150040098.png)
+
+#### 5.4.2 写操作
+
+`DFSOutputStream`中使用`Packet`类来封装一个数据包。每个数据包中都包含若干个校验块，以及校验块对应的校验和。一个完整的数据包结构如图所示。首先是数据包包头，
+记录了数据包的概要属性信息，然后是校验和数据，最后是校验块数据。`Packet`类提供了`writeData()`以及`writeChecksum()`方法向数据块中写入校验块数据以及校验和。
+
+![image-20220504151157452](images/image-20220504151157452.png)
+
+`DFSOutputStream.write()`方法可以将指定大小的数据写入数据流内部的一个缓冲区中，写入的数据会被切分成多个数据包，每个数据包又由一组校验块和这组校验块对应的校验和组
+成，默认数据包大小为`65536`字节，校验块大小为`512`字节，每个校验和都是校验块的`512`字节数据对应的校验值。这里的数据包大小、校验块大小是在`computePacketChunkSize()`方法中定义的。
+
+当`Client`写入的字节流数据达到一个数据包的长度时，`DFSOutputStream`会构造一个`Packet`对象保存这个要发送的数据包。如果当前数据块中的所有数据包都==发送完毕了==，`DFSOutputStream`会发送一个==空的数据包标识数据块发送完毕==。新构造的`Packet`对象会被放到`DFSOutputStream.dataQueue`队列中，由`DFSOutputStream`的内部线程类`DataStreamer`处理。
+
+`DataStreamer`线程会从`dataQueue`中取出`Packet`对象，然后通过底层`IO`流将这个`Pakcet`发送到数据流管道中的第一个`Datanode`上。发送完毕后，将`Packet`从`dataQueue`中移除，放入`ackQueue`中等待下游节点的确认消息。确认消息是由`DataStreamer`的内部线程类`ResponseProcessor`处理的。`ResponseProcessor`线程等待下游节点的响应`ack`,判断`ack`状态码，如果是失败状态，则记录出错`Datanode`的索引`(errorIndex&restartIndex)`,并设置错误状态位(`hasError`)。如果`ack`状态是成功，则将数据包从`ack`队列中移除，整个数据包发送过程完成。
+
+![image-20220504151750217](images/image-20220504151750217.png)
+
+如果在数据块发送过程中出现错误，那所有`ackQueue`队列中等待确认的`Packet`都会被重新放回`dataQueue`队列中重新发送。客户端会执行错误处理流程，将出现错误的`Datanode`从
+数据流管道中删除，然后向`Namenode`申请新的`Datanode`重建数据流管道。接着`DataStreamer`线程会从`dataQueue`队列中取出`Packet`重新发送。
 
 
 
+#### 5.4.4 租约相关
 
+租约是`HDFS`中一个很重要的概念，是`Namenode`给予租约持有者(`LeaseHolder`)(一般是客户端)在规定时间内拥有文件权限（写文件)的合同。
 
+客户端写文件时需要先从租约管理器(`LeaseManager`)中申请一个租约，成功申请之后客户端就成为了租约持有者，也就拥有了对该`HDFS`文件的独占权限，其他客户端在该租约
+有效时无法打开这个`HDFS`文件进行操作。`Namenode`的租约管理器会定期检查它维护的租约是否过期，如果有过期的租约，租约管理器会执行租约恢复机制关闭`HDFS`文件，所以持有
+租约的客户端需要定期更新租约(`renew`)。当客户端完成了对文件的写操作，关闭文件时，必须在租约管理器中释放租约。
 
 
 
